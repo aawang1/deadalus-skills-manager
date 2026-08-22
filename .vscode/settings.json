@@ -1,0 +1,9 @@
+{
+  "task.autoDetect": "off",
+  "npm.autoDetect": "off",
+  "npm.packageManager": "npm",
+  "npm.exclude": [
+    "**/node_modules/**",
+    "**/src-tauri/target/**"
+  ]
+}

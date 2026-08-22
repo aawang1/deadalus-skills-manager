@@ -1,0 +1,10 @@
+{
+  "name": "deadalus",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix apps/desktop",
+    "build": "npm run build --prefix apps/desktop",
+    "preview": "npm run preview --prefix apps/desktop",
+    "tauri": "npm run tauri --prefix apps/desktop"
+  }
+}

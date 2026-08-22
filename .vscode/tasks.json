@@ -1,0 +1,59 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev",
+      "type": "shell",
+      "command": "npm run dev",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "npm run build",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "preview",
+      "type": "shell",
+      "command": "npm run preview",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "tauri dev",
+      "type": "shell",
+      "command": "npm run tauri dev",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "tauri build",
+      "type": "shell",
+      "command": "npm run tauri build",
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
