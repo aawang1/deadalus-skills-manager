@@ -117,6 +117,9 @@ describe("SkillGraph", () => {
     render(<SkillGraph activeView="cursor" isNative refreshKey={0} />);
 
     const cluster = await screen.findByRole("button", { name: "开发 集群" });
+    expect(cluster).toHaveAttribute("transform");
+    expect(cluster.querySelector("circle")).toBeTruthy();
+    expect(cluster.querySelector("text")).toHaveTextContent("开发");
     await user.dblClick(cluster);
     expect(screen.getByText("开发与测试能力")).toBeInTheDocument();
   });

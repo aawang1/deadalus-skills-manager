@@ -770,7 +770,6 @@ select {
 .skill-graph__cluster-center {
   outline: none;
   cursor: pointer;
-  animation: skill-cluster-breathe 6.4s ease-in-out infinite alternate;
 }
 
 .skill-graph__cluster-center circle {
@@ -778,6 +777,9 @@ select {
   stroke: rgba(80, 137, 215, 0.58);
   stroke-width: 1.4;
   vector-effect: non-scaling-stroke;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: skill-cluster-breathe 6.4s ease-in-out infinite alternate;
 }
 
 .skill-graph__cluster-center text {
@@ -984,8 +986,14 @@ select {
 }
 
 @keyframes skill-cluster-breathe {
-  from { transform: scale(0.97); }
-  to { transform: scale(1.035); }
+  from {
+    opacity: 0.82;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1.035);
+  }
 }
 
 .assistant-platform {
