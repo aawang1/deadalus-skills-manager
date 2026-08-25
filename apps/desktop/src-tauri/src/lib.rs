@@ -1,6 +1,7 @@
 pub mod adaptive;
 pub mod application;
 pub mod database;
+pub mod graph;
 pub mod pipeline;
 pub mod validation;
 pub mod vectorization;
@@ -32,6 +33,7 @@ use database::{
     AdaptiveHistoryRecord, CanonicalFile, CanonicalSkill, CanonicalSnapshot, Database,
     FeedbackEventRecord, LocalValidationMutation, ValidationRunRecord, ValidationSampleRecord,
 };
+use graph::{build_skill_graph, empty_graph, SkillGraphSnapshot};
 use pipeline::{
     compare_analysis, estimate_preflight, prepare_skill_inputs, rule_result, EmbeddingJobContext,
     EmbeddingProvider, IndexDiff, IndexSyncStatus, JobStrategy, PreparedProfileChange,
@@ -1667,6 +1669,47 @@ fn list_skill_relations(
     database
         .relationships_for_skill_profile(&skill_id, profile_id.as_deref())
         .map_err(|error| format!("无法读取 Skill 关系：{error}"))
+}
+
+#[tauri::command]
+fn get_skill_graph(
+    database: State<'_, Database>,
+    view_id: String,
+) -> Result<SkillGraphSnapshot, String> {
+    if !matches!(view_id.as_str(), "all" | "claude-code" | "cursor" | "codex") {
+        return Err(format!("未知 Skills 分类：{view_id}"));
+    }
+    let Some(profile) = database
+        .active_profile()
+        .map_err(|error| format!("无法读取活动 Profile：{error}"))?
+    else {
+        return Ok(empty_graph(&view_id));
+    };
+    let Some(snapshot) = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+    else {
+        let mut graph = empty_graph(&view_id);
+        graph.profile_id = Some(profile.profile_id);
+        graph.graph_version = format!(
+            "no-canonical-snapshot:{}",
+            graph.profile_id.as_deref().unwrap()
+        );
+        return Ok(graph);
+    };
+    let vectors = database
+        .load_vectors(&profile.profile_id)
+        .map_err(|error| format!("无法读取活动 Profile 向量：{error}"))?;
+    let relationships = database
+        .relationships_for_profile(&profile.profile_id)
+        .map_err(|error| format!("无法读取活动 Profile 关系：{error}"))?;
+    Ok(build_skill_graph(
+        &snapshot,
+        &profile.profile_id,
+        &vectors,
+        &relationships,
+        &view_id,
+    ))
 }
 
 #[tauri::command]
@@ -3593,6 +3636,7 @@ pub fn run() {
             cancel_embedding_job,
             semantic_search,
             list_skill_relations,
+            get_skill_graph,
             generate_local_validation_samples,
             list_local_validation_samples,
             run_local_validation,

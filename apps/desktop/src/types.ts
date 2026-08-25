@@ -282,6 +282,42 @@ export interface SkillRelationship {
   validatedAt?: number;
 }
 
+export interface SkillGraphSnapshot {
+  graphVersion: string;
+  profileId?: string;
+  viewId: ViewId;
+  nodes: SkillGraphNode[];
+  edges: SkillGraphEdge[];
+  excludedUnreadyCount: number;
+  excludedUnconnectedCount: number;
+}
+
+export interface SkillGraphNode {
+  skillId: string;
+  name: string;
+  description?: string;
+  path: string;
+  enabledAgents: AgentId[];
+}
+
+export interface SkillGraphEdge {
+  edgeId: string;
+  sourceSkillId: string;
+  targetSkillId: string;
+  similarity: number;
+  relations: SkillGraphRelation[];
+  nearestFallback: boolean;
+}
+
+export interface SkillGraphRelation {
+  relationshipType: RelationshipType;
+  vectorType?: VectorType;
+  state: string;
+  score?: number;
+  source: "stored" | "vector_similarity";
+  evidence: unknown;
+}
+
 export interface ValidationSample {
   sampleId: string;
   datasetId: string;

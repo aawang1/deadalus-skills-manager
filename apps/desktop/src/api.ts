@@ -23,6 +23,7 @@ import type {
   ProgressEvent,
   ProviderModelsResponse,
   SemanticSearchResult,
+  SkillGraphSnapshot,
   SkillRelationship,
   ToastMessage,
   ValidationRun,
@@ -130,6 +131,8 @@ export const api = {
       skillId,
       profileId,
     }),
+  getSkillGraph: (viewId: string) =>
+    invoke<SkillGraphSnapshot>("get_skill_graph", { viewId }),
 
   generateLocalValidationSamples: (profileId?: string) =>
     invoke<ValidationSample[]>("generate_local_validation_samples", {

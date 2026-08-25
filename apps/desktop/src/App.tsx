@@ -12,11 +12,13 @@ import { api, isNativeRuntime as detectNativeRuntime } from "./api";
 import { filterCanonicalSkills } from "./canonical";
 import { SemanticSearch } from "./components/SemanticSearch";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { SkillGraph } from "./components/SkillGraph";
 import type {
   AgentId,
   AgentSkillsResponse,
   CanonicalSnapshot,
   InstalledSkill,
+  ProgressEvent,
   ViewId,
 } from "./types";
 import "./App.css";
@@ -43,6 +45,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [agentFilter, setAgentFilter] = useState<"all" | AgentId>("all");
   const [libraryVersion, setLibraryVersion] = useState(0);
+  const [graphRevision, setGraphRevision] = useState(0);
   const [skillAction, setSkillAction] = useState<{
     path: string | null;
     message: string;
@@ -140,8 +143,27 @@ function App() {
     };
   }, [isNativeRuntime]);
 
+  useEffect(() => {
+    if (!isNativeRuntime) return;
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    listen<ProgressEvent>("embedding-job-progress", ({ payload }) => {
+      if (payload.total > 0 && payload.completed >= payload.total) {
+        setGraphRevision((revision) => revision + 1);
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [isNativeRuntime]);
+
   const closeKeyDialog = () => {
     setIsKeyDialogOpen(false);
+    setGraphRevision((revision) => revision + 1);
     requestAnimationFrame(() => dButtonRef.current?.focus());
   };
 
@@ -575,7 +597,15 @@ function App() {
         )}
       </aside>
 
-      <main className="main-platform" aria-label="A1 可视化工作区" />
+      <main className="main-platform" aria-label="A1 可视化工作区">
+        {activeView && (
+          <SkillGraph
+            activeView={activeView}
+            isNative={isNativeRuntime}
+            refreshKey={graphRevision + libraryVersion}
+          />
+        )}
+      </main>
 
       <aside
         className="assistant-platform"

@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   getCanonicalSkillsSnapshot: vi.fn(),
   refreshCanonicalSkillsSnapshot: vi.fn(),
   semanticSearch: vi.fn(),
+  getSkillGraph: vi.fn(),
   listen: vi.fn(),
 }));
 
@@ -16,6 +17,7 @@ vi.mock("./api", () => ({
     getCanonicalSkillsSnapshot: mocks.getCanonicalSkillsSnapshot,
     refreshCanonicalSkillsSnapshot: mocks.refreshCanonicalSkillsSnapshot,
     semanticSearch: mocks.semanticSearch,
+    getSkillGraph: mocks.getSkillGraph,
   },
 }));
 
@@ -42,6 +44,15 @@ describe("B3 assistant platform", () => {
       skills: [],
     });
     mocks.semanticSearch.mockResolvedValue([]);
+    mocks.getSkillGraph.mockResolvedValue({
+      graphVersion: "graph-a",
+      profileId: "profile-a",
+      viewId: "all",
+      nodes: [],
+      edges: [],
+      excludedUnreadyCount: 0,
+      excludedUnconnectedCount: 0,
+    });
     mocks.listen.mockResolvedValue(() => undefined);
   });
 
@@ -93,5 +104,82 @@ describe("B3 assistant platform", () => {
 
     await user.click(expand);
     expect(screen.getByRole("heading", { name: "所有 Skills" })).toBeInTheDocument();
+  });
+});
+
+describe("B2 skills list collapse", () => {
+  beforeEach(() => {
+    mocks.getCanonicalSkillsSnapshot.mockResolvedValue({
+      snapshotId: "snapshot-a",
+      searchedPaths: [],
+      warnings: [],
+      skills: [],
+    });
+    mocks.refreshCanonicalSkillsSnapshot.mockResolvedValue({
+      snapshotId: "snapshot-b",
+      searchedPaths: [],
+      warnings: [],
+      skills: [],
+    });
+    mocks.semanticSearch.mockResolvedValue([]);
+    mocks.getSkillGraph.mockResolvedValue({
+      graphVersion: "graph-a",
+      profileId: "profile-a",
+      viewId: "all",
+      nodes: [],
+      edges: [],
+      excludedUnreadyCount: 0,
+      excludedUnconnectedCount: 0,
+    });
+    mocks.listen.mockResolvedValue(() => undefined);
+  });
+
+  it("collapses to a toggle strip while keeping the category selected", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    const category = screen.getByRole("button", { name: "所有 Skills" });
+    expect(category).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("heading", { name: "所有 Skills" })).toBeInTheDocument();
+
+    const collapse = screen.getByRole("button", { name: "收起 Skills 列表" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    await user.click(collapse);
+
+    expect(category).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.queryByRole("heading", { name: "所有 Skills" }),
+    ).not.toBeInTheDocument();
+    const expand = screen.getByRole("button", { name: "展开 Skills 列表" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(expand);
+    expect(screen.getByRole("heading", { name: "所有 Skills" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "收起 Skills 列表" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("keeps the collapsed strip when switching categories", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "收起 Skills 列表" }));
+    await user.click(screen.getByRole("button", { name: "Claude Code Skills" }));
+
+    expect(screen.getByRole("button", { name: "所有 Skills" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(
+      screen.getByRole("button", { name: "Claude Code Skills" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "展开 Skills 列表" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("heading", { name: "Claude Code" })).not.toBeInTheDocument();
   });
 });

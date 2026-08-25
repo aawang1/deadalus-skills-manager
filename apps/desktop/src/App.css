@@ -669,6 +669,248 @@ select {
   content: none;
 }
 
+.skill-graph {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  background:
+    radial-gradient(circle at center, rgba(57, 132, 255, 0.035), transparent 52%),
+    var(--color-canvas);
+}
+
+.skill-graph__canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  touch-action: none;
+  user-select: none;
+  cursor: grab;
+}
+
+.skill-graph__canvas:active {
+  cursor: grabbing;
+}
+
+.skill-graph__edge-line {
+  stroke: rgba(126, 162, 216, 0.34);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.skill-graph__edge-flow {
+  stroke: rgba(108, 169, 255, 0.62);
+  stroke-width: 1;
+  stroke-dasharray: 2 12;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+  animation: skill-edge-flow 3.4s linear infinite;
+}
+
+.skill-graph__edge:nth-child(3n + 2) .skill-graph__edge-flow {
+  animation-duration: 4.2s;
+  animation-direction: reverse;
+}
+
+.skill-graph__edge-hit {
+  stroke: transparent;
+  stroke-width: 12;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+}
+
+.skill-graph__edge.is-expanded .skill-graph__edge-line {
+  stroke: rgba(140, 187, 255, 0.72);
+  stroke-width: 1.5;
+}
+
+.skill-graph__center circle {
+  fill: #0d1420;
+  stroke: rgba(57, 132, 255, 0.62);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.skill-graph__center text {
+  fill: #dce9ff;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.skill-graph__node {
+  outline: none;
+  cursor: grab;
+}
+
+.skill-graph__node:active {
+  cursor: grabbing;
+}
+
+.skill-graph__node-motion {
+  animation: skill-node-float 5.8s ease-in-out infinite alternate;
+}
+
+.skill-graph__node-dot {
+  fill: #111b2a;
+  stroke: rgba(124, 176, 255, 0.88);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  transition:
+    fill 160ms ease,
+    stroke 160ms ease;
+}
+
+.skill-graph__node-halo {
+  fill: rgba(57, 132, 255, 0.045);
+  stroke: rgba(57, 132, 255, 0.12);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  animation: skill-node-pulse 3.8s ease-in-out infinite;
+}
+
+.skill-graph__node:hover .skill-graph__node-dot,
+.skill-graph__node:focus-visible .skill-graph__node-dot {
+  fill: #172944;
+  stroke: #a9cbff;
+}
+
+.skill-graph__node:focus-visible .skill-graph__node-halo {
+  stroke: var(--color-accent);
+  stroke-width: 2;
+}
+
+.skill-graph__node text {
+  fill: var(--color-text-muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 8px;
+  paint-order: stroke;
+  stroke: rgba(5, 6, 8, 0.92);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.skill-graph__popup-shell {
+  overflow: visible;
+}
+
+.skill-graph__popup {
+  display: flex;
+  max-height: 100%;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.7rem;
+  overflow: auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.55rem;
+  color: var(--color-text);
+  background: rgba(12, 15, 20, 0.97);
+  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.32);
+  font-size: 0.625rem;
+  line-height: 1.45;
+  pointer-events: auto;
+}
+
+.skill-graph__popup strong {
+  font-size: 0.6875rem;
+}
+
+.skill-graph__popup p {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
+.skill-graph__popup > small {
+  color: #8cb9ff;
+}
+
+.skill-graph__popup code {
+  overflow: hidden;
+  color: var(--color-text-faint);
+  font-size: 0.5rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-graph__popup ul {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.skill-graph__popup li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 0.3rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.skill-graph__popup li small {
+  flex: 0 0 auto;
+  color: var(--color-text-faint);
+  font-size: 0.48rem;
+}
+
+.skill-graph__status {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.625rem;
+  color: var(--color-text-faint);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 0.5rem;
+  pointer-events: none;
+}
+
+.skill-graph__empty {
+  position: absolute;
+  top: calc(50% + 2.75rem);
+  left: 50%;
+  margin: 0;
+  color: var(--color-text-faint);
+  font-size: 0.625rem;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+@keyframes skill-node-float {
+  0% {
+    transform: translate3d(-1.8px, 1px, 0) rotate(-0.35deg);
+  }
+  50% {
+    transform: translate3d(1px, -2px, 0) rotate(0.2deg);
+  }
+  100% {
+    transform: translate3d(2px, 1.4px, 0) rotate(0.4deg);
+  }
+}
+
+@keyframes skill-node-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes skill-edge-flow {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
 .assistant-platform {
   position: relative;
   z-index: 2;
