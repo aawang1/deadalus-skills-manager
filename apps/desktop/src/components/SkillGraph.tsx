@@ -19,6 +19,7 @@ import {
   getSkillGraphLayout,
   graphViewport,
   parallelEdgeOffset,
+  propagateDragOffsets,
   type GraphPoint,
 } from "./skillGraphLayout";
 
@@ -268,10 +269,14 @@ export function SkillGraph({
       setPanOffset(next);
       return;
     }
-    const nextOffsets = {
-      ...dragOffsetsRef.current,
-      [drag.nodeId]: { x: drag.origin.x + dx, y: drag.origin.y + dy },
-    };
+    if (!graph) return;
+    const nextOffsets = propagateDragOffsets(
+      graph,
+      layout,
+      drag.nodeId,
+      { x: drag.origin.x + dx, y: drag.origin.y + dy },
+      dragOffsetsRef.current,
+    );
     dragOffsetsRef.current = nextOffsets;
     setDragOffsets(nextOffsets);
   };

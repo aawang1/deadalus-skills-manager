@@ -52,6 +52,115 @@ export function calculateSkillGraphLayout(graph: SkillGraphSnapshot): SkillGraph
   return { nodePoints, clusterPoints, clusterRadii };
 }
 
+export function propagateDragOffsets(
+  graph: SkillGraphSnapshot,
+  layout: SkillGraphLayout,
+  draggedSkillId: string,
+  draggedOffset: GraphPoint,
+  previousOffsets: Record<string, GraphPoint>,
+): Record<string, GraphPoint> {
+  const positions = new Map(
+    graph.nodes.map((node) => {
+      const base = layout.nodePoints.get(node.skillId) ?? CENTER;
+      const previous = previousOffsets[node.skillId] ?? { x: 0, y: 0 };
+      return [node.skillId, { x: base.x + previous.x, y: base.y + previous.y }];
+    }),
+  );
+  const draggedBase = layout.nodePoints.get(draggedSkillId) ?? CENTER;
+  const draggedTarget = {
+    x: clamp(draggedBase.x + draggedOffset.x, PADDING, WIDTH - PADDING),
+    y: clamp(draggedBase.y + draggedOffset.y, PADDING, HEIGHT - PADDING),
+  };
+  positions.set(draggedSkillId, draggedTarget);
+
+  const springs = [
+    ...graph.edges.map((edge) => ({
+      source: edge.sourceSkillId,
+      target: edge.targetSkillId,
+      strength: 0.22,
+    })),
+    ...graph.proximities.map((relation) => ({
+      source: relation.sourceSkillId,
+      target: relation.targetSkillId,
+      strength: 0.035 + relation.weight * 0.055,
+    })),
+  ].map((spring) => {
+    const source = layout.nodePoints.get(spring.source);
+    const target = layout.nodePoints.get(spring.target);
+    return {
+      ...spring,
+      rest: source && target ? Math.max(NODE_GAP, Math.hypot(target.x - source.x, target.y - source.y)) : NODE_GAP,
+    };
+  });
+
+  for (let iteration = 0; iteration < 14; iteration += 1) {
+    const forces = new Map(graph.nodes.map((node) => [node.skillId, { x: 0, y: 0 }]));
+    for (const spring of springs) {
+      const source = positions.get(spring.source);
+      const target = positions.get(spring.target);
+      if (!source || !target) continue;
+      const delta = safeDelta(source, target, `drag:${spring.source}:${spring.target}`);
+      const pull = (delta.distance - spring.rest) * spring.strength;
+      if (spring.source !== draggedSkillId) {
+        forces.get(spring.source)!.x += delta.x * pull;
+        forces.get(spring.source)!.y += delta.y * pull;
+      }
+      if (spring.target !== draggedSkillId) {
+        forces.get(spring.target)!.x -= delta.x * pull;
+        forces.get(spring.target)!.y -= delta.y * pull;
+      }
+    }
+    for (const node of graph.nodes) {
+      if (node.skillId === draggedSkillId) continue;
+      const point = positions.get(node.skillId)!;
+      const base = layout.nodePoints.get(node.skillId) ?? CENTER;
+      const force = forces.get(node.skillId)!;
+      force.x += (base.x - point.x) * 0.035;
+      force.y += (base.y - point.y) * 0.035;
+      point.x = clamp(point.x + force.x * 0.58, PADDING, WIDTH - PADDING);
+      point.y = clamp(point.y + force.y * 0.58, PADDING, HEIGHT - PADDING);
+    }
+    resolveInteractiveCollisions(positions, draggedSkillId);
+    positions.set(draggedSkillId, draggedTarget);
+  }
+
+  return Object.fromEntries(
+    graph.nodes.map((node) => {
+      const base = layout.nodePoints.get(node.skillId) ?? CENTER;
+      const point = positions.get(node.skillId) ?? base;
+      return [node.skillId, { x: point.x - base.x, y: point.y - base.y }];
+    }),
+  );
+}
+
+function resolveInteractiveCollisions(points: Map<string, GraphPoint>, fixedId: string) {
+  const entries = [...points.entries()];
+  for (let pass = 0; pass < 4; pass += 1) {
+    let changed = false;
+    for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+      const [leftId, left] = entries[leftIndex];
+      const [rightId, right] = entries[rightIndex];
+      const delta = safeDelta(left, right, `interactive:${leftId}:${rightId}`);
+      if (delta.distance >= NODE_GAP) continue;
+      const overlap = NODE_GAP - delta.distance + 0.15;
+      if (leftId === fixedId) {
+        right.x = clamp(right.x + delta.x * overlap, PADDING, WIDTH - PADDING);
+        right.y = clamp(right.y + delta.y * overlap, PADDING, HEIGHT - PADDING);
+      } else if (rightId === fixedId) {
+        left.x = clamp(left.x - delta.x * overlap, PADDING, WIDTH - PADDING);
+        left.y = clamp(left.y - delta.y * overlap, PADDING, HEIGHT - PADDING);
+      } else {
+        left.x = clamp(left.x - delta.x * overlap * 0.5, PADDING, WIDTH - PADDING);
+        left.y = clamp(left.y - delta.y * overlap * 0.5, PADDING, HEIGHT - PADDING);
+        right.x = clamp(right.x + delta.x * overlap * 0.5, PADDING, WIDTH - PADDING);
+        right.y = clamp(right.y + delta.y * overlap * 0.5, PADDING, HEIGHT - PADDING);
+      }
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
 function refineClusterNodes(graph: SkillGraphSnapshot, points: Map<string, GraphPoint>, centers: Map<string, GraphPoint>, radii: Map<string, number>) {
   const nodes = new Map(graph.nodes.map((node) => [node.skillId, node]));
   const anchors = new Map([...points].map(([id, point]) => [id, { ...point }]));

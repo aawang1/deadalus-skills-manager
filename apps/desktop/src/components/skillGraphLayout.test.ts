@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SkillGraphSnapshot } from "../types";
-import { calculateSkillGraphLayout, parallelEdgeOffset } from "./skillGraphLayout";
+import { calculateSkillGraphLayout, parallelEdgeOffset, propagateDragOffsets } from "./skillGraphLayout";
 
 const graph: SkillGraphSnapshot = {
   graphVersion: "graph",
@@ -39,5 +39,20 @@ describe("skill graph layout", () => {
   it("centers parallel edge offsets", () => {
     expect([0, 1, 2].map((index) => parallelEdgeOffset(index, 3))).toEqual([-7, 0, 7]);
     expect(parallelEdgeOffset(0, 1)).toBe(0);
+  });
+
+  it("propagates a dragged node through springs and prevents overlap", () => {
+    const layout = calculateSkillGraphLayout(graph);
+    const offsets = propagateDragOffsets(graph, layout, "a", { x: 140, y: 20 }, {});
+    expect(Math.hypot(offsets.a.x, offsets.a.y)).toBeGreaterThan(100);
+    expect(Math.hypot(offsets.b.x, offsets.b.y)).toBeGreaterThan(1);
+
+    const positions = graph.nodes.map((node) => {
+      const base = layout.nodePoints.get(node.skillId)!;
+      return { x: base.x + offsets[node.skillId].x, y: base.y + offsets[node.skillId].y };
+    });
+    for (let left = 0; left < positions.length; left += 1) for (let right = left + 1; right < positions.length; right += 1) {
+      expect(Math.hypot(positions[left].x - positions[right].x, positions[left].y - positions[right].y)).toBeGreaterThanOrEqual(61.7);
+    }
   });
 });
