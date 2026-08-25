@@ -32,6 +32,7 @@ function App() {
   const [isKeyDialogOpen, setIsKeyDialogOpen] = useState(false);
   const [isAssistantOpen, setIsAssistantOpen] = useState(false);
   const [activeView, setActiveView] = useState<ViewId | null>(null);
+  const [isSkillsListCollapsed, setIsSkillsListCollapsed] = useState(false);
   const [skillResult, setSkillResult] = useState<AgentSkillsResponse | null>(
     null,
   );
@@ -58,7 +59,11 @@ function App() {
 
   const b2Width = Math.round(window.screen.width * 0.15);
   const shellStyle = {
-    "--skills-width": activeView ? `${b2Width}px` : "0px",
+    "--skills-width": !activeView
+      ? "0px"
+      : isSkillsListCollapsed
+        ? "var(--skills-collapse-width)"
+        : `${b2Width}px`,
   } as CSSProperties;
 
   useEffect(() => {
@@ -141,7 +146,12 @@ function App() {
   };
 
   const toggleView = (view: ViewId) => {
-    setActiveView((current) => (current === view ? null : view));
+    const closing = activeView === view;
+    const openingFromIdle = activeView === null;
+    setActiveView(closing ? null : view);
+    if (closing || openingFromIdle) {
+      setIsSkillsListCollapsed(false);
+    }
     setSearchQuery("");
     setAgentFilter("all");
     setSkillAction({ path: null, message: "", type: "idle" });
@@ -231,8 +241,8 @@ function App() {
   return (
     <div
       className={`app-shell ${activeView ? "app-shell--skills-open" : ""} ${
-        isAssistantOpen ? "app-shell--assistant-open" : ""
-      }`}
+        activeView && isSkillsListCollapsed ? "app-shell--skills-collapsed" : ""
+      } ${isAssistantOpen ? "app-shell--assistant-open" : ""}`}
       data-page="a1"
       style={shellStyle}
     >
@@ -306,28 +316,71 @@ function App() {
       </aside>
 
       <aside
-        className="skills-platform"
+        className={`skills-platform${
+          isSkillsListCollapsed ? " skills-platform--collapsed" : ""
+        }`}
         aria-label="Agent Skills"
         aria-hidden={!activeView}
       >
         {activeView && (
           <>
             <header className="skills-header">
-              <div>
-                <p className="eyebrow">
-                  {activeView === "all" ? "SKILL LIBRARY" : "AGENT SKILLS"}
-                </p>
-                <h2>
-                  {activeView === "all"
-                    ? "所有 Skills"
-                    : agents.find((agent) => agent.id === activeView)?.label}
-                </h2>
+              {!isSkillsListCollapsed && (
+                <div>
+                  <p className="eyebrow">
+                    {activeView === "all" ? "SKILL LIBRARY" : "AGENT SKILLS"}
+                  </p>
+                  <h2>
+                    {activeView === "all"
+                      ? "所有 Skills"
+                      : agents.find((agent) => agent.id === activeView)?.label}
+                  </h2>
+                </div>
+              )}
+              <div className="skills-header__actions">
+                {!isSkillsListCollapsed && (
+                  <span className="skill-count">
+                    {skillState === "ready" ? visibleSkills.length : "—"}
+                  </span>
+                )}
+                <button
+                  className="skills-collapse-toggle"
+                  type="button"
+                  aria-label={
+                    isSkillsListCollapsed
+                      ? "展开 Skills 列表"
+                      : "收起 Skills 列表"
+                  }
+                  aria-expanded={!isSkillsListCollapsed}
+                  title={
+                    isSkillsListCollapsed
+                      ? "展开 Skills 列表"
+                      : "收起 Skills 列表"
+                  }
+                  onClick={() =>
+                    setIsSkillsListCollapsed((current) => !current)
+                  }
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d={
+                        isSkillsListCollapsed
+                          ? "M9 6l6 6-6 6"
+                          : "M15 6l-6 6 6 6"
+                      }
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
               </div>
-              <span className="skill-count">
-                {skillState === "ready" ? visibleSkills.length : "—"}
-              </span>
             </header>
 
+            {!isSkillsListCollapsed && (
+              <>
             <div className="skills-content">
               {activeView === "all" && (
                 <div className="all-skills-tools">
@@ -515,6 +568,8 @@ function App() {
                   {skillResult.searchedPaths.length} 个扫描目录
                 </span>
               </footer>
+            )}
+              </>
             )}
           </>
         )}
