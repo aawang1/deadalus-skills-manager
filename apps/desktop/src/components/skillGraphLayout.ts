@@ -133,6 +133,85 @@ export function propagateDragOffsets(
   );
 }
 
+export function propagateClusterDragOffsets(
+  graph: SkillGraphSnapshot,
+  layout: SkillGraphLayout,
+  draggedClusterId: string,
+  draggedOffset: GraphPoint,
+  previousOffsets: Record<string, GraphPoint>,
+): Record<string, GraphPoint> {
+  const positions = new Map(
+    graph.clusters.map((cluster) => {
+      const base = layout.clusterPoints.get(cluster.clusterId) ?? CENTER;
+      const previous = previousOffsets[cluster.clusterId] ?? { x: 0, y: 0 };
+      return [cluster.clusterId, { x: base.x + previous.x, y: base.y + previous.y }];
+    }),
+  );
+  const draggedBase = layout.clusterPoints.get(draggedClusterId) ?? CENTER;
+  const draggedRadius = layout.clusterRadii.get(draggedClusterId) ?? 100;
+  const draggedTarget = {
+    x: clamp(draggedBase.x + draggedOffset.x, PADDING + draggedRadius, WIDTH - PADDING - draggedRadius),
+    y: clamp(draggedBase.y + draggedOffset.y, PADDING + draggedRadius, HEIGHT - PADDING - draggedRadius),
+  };
+  positions.set(draggedClusterId, draggedTarget);
+
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    for (const cluster of graph.clusters) {
+      if (cluster.clusterId === draggedClusterId) continue;
+      const point = positions.get(cluster.clusterId)!;
+      const base = layout.clusterPoints.get(cluster.clusterId) ?? CENTER;
+      point.x += (base.x - point.x) * 0.035;
+      point.y += (base.y - point.y) * 0.035;
+    }
+    resolveClusterCollisions(graph.clusters, positions, layout.clusterRadii, draggedClusterId);
+    positions.set(draggedClusterId, draggedTarget);
+  }
+
+  return Object.fromEntries(
+    graph.clusters.map((cluster) => {
+      const base = layout.clusterPoints.get(cluster.clusterId) ?? CENTER;
+      const point = positions.get(cluster.clusterId) ?? base;
+      return [cluster.clusterId, { x: point.x - base.x, y: point.y - base.y }];
+    }),
+  );
+}
+
+function resolveClusterCollisions(
+  clusters: SkillGraphCluster[],
+  points: Map<string, GraphPoint>,
+  radii: Map<string, number>,
+  fixedId: string,
+) {
+  for (let pass = 0; pass < 6; pass += 1) {
+    let changed = false;
+    for (let leftIndex = 0; leftIndex < clusters.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < clusters.length; rightIndex += 1) {
+      const leftId = clusters[leftIndex].clusterId;
+      const rightId = clusters[rightIndex].clusterId;
+      const left = points.get(leftId)!;
+      const right = points.get(rightId)!;
+      const delta = safeDelta(left, right, `cluster-drag:${leftId}:${rightId}`);
+      const minimum = (radii.get(leftId) ?? 100) + (radii.get(rightId) ?? 100) + 30;
+      if (delta.distance >= minimum) continue;
+      const overlap = minimum - delta.distance + 0.25;
+      if (leftId === fixedId) {
+        moveClusterPoint(right, delta.x * overlap, delta.y * overlap, radii.get(rightId) ?? 100);
+      } else if (rightId === fixedId) {
+        moveClusterPoint(left, -delta.x * overlap, -delta.y * overlap, radii.get(leftId) ?? 100);
+      } else {
+        moveClusterPoint(left, -delta.x * overlap * 0.5, -delta.y * overlap * 0.5, radii.get(leftId) ?? 100);
+        moveClusterPoint(right, delta.x * overlap * 0.5, delta.y * overlap * 0.5, radii.get(rightId) ?? 100);
+      }
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
+function moveClusterPoint(point: GraphPoint, dx: number, dy: number, radius: number) {
+  point.x = clamp(point.x + dx, PADDING + radius, WIDTH - PADDING - radius);
+  point.y = clamp(point.y + dy, PADDING + radius, HEIGHT - PADDING - radius);
+}
+
 function resolveInteractiveCollisions(points: Map<string, GraphPoint>, fixedId: string) {
   const entries = [...points.entries()];
   for (let pass = 0; pass < 4; pass += 1) {

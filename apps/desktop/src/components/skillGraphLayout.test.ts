@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SkillGraphSnapshot } from "../types";
-import { calculateSkillGraphLayout, parallelEdgeOffset, propagateDragOffsets } from "./skillGraphLayout";
+import { calculateSkillGraphLayout, parallelEdgeOffset, propagateClusterDragOffsets, propagateDragOffsets } from "./skillGraphLayout";
 
 const graph: SkillGraphSnapshot = {
   graphVersion: "graph",
@@ -54,5 +54,38 @@ describe("skill graph layout", () => {
     for (let left = 0; left < positions.length; left += 1) for (let right = left + 1; right < positions.length; right += 1) {
       expect(Math.hypot(positions[left].x - positions[right].x, positions[left].y - positions[right].y)).toBeGreaterThanOrEqual(61.7);
     }
+  });
+
+  it("moves a whole cluster and pushes an overlapping cluster away", () => {
+    const twoClusters: SkillGraphSnapshot = {
+      ...graph,
+      graphVersion: "two-clusters",
+      layoutVersion: "two-clusters",
+      clusters: [
+        graph.clusters[0],
+        { clusterId: "cluster-b", name: "文档", summary: "文档能力", memberSkillIds: ["d", "e"], coreSkillIds: ["d", "e"], peripheral: false },
+      ],
+      nodes: [
+        ...graph.nodes,
+        { skillId: "d", name: "D", path: "C:/d", enabledAgents: ["cursor"], clusterId: "cluster-b", centrality: 0.9, superseded: false },
+        { skillId: "e", name: "E", path: "C:/e", enabledAgents: ["cursor"], clusterId: "cluster-b", centrality: 0.86, superseded: false },
+      ],
+    };
+    const layout = calculateSkillGraphLayout(twoClusters);
+    const first = layout.clusterPoints.get("cluster-a")!;
+    const second = layout.clusterPoints.get("cluster-b")!;
+    const offsets = propagateClusterDragOffsets(
+      twoClusters,
+      layout,
+      "cluster-a",
+      { x: second.x - first.x, y: second.y - first.y },
+      {},
+    );
+    expect(Math.hypot(offsets["cluster-a"].x, offsets["cluster-a"].y)).toBeGreaterThan(1);
+    expect(Math.hypot(offsets["cluster-b"].x, offsets["cluster-b"].y)).toBeGreaterThan(1);
+    const movedFirst = { x: first.x + offsets["cluster-a"].x, y: first.y + offsets["cluster-a"].y };
+    const movedSecond = { x: second.x + offsets["cluster-b"].x, y: second.y + offsets["cluster-b"].y };
+    const minimum = layout.clusterRadii.get("cluster-a")! + layout.clusterRadii.get("cluster-b")! + 29;
+    expect(Math.hypot(movedFirst.x - movedSecond.x, movedFirst.y - movedSecond.y)).toBeGreaterThanOrEqual(minimum);
   });
 });

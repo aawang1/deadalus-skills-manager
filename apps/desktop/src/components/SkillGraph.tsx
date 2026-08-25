@@ -19,6 +19,7 @@ import {
   getSkillGraphLayout,
   graphViewport,
   parallelEdgeOffset,
+  propagateClusterDragOffsets,
   propagateDragOffsets,
   type GraphPoint,
 } from "./skillGraphLayout";
@@ -45,6 +46,13 @@ type ActiveDrag =
     }
   | {
       type: "canvas";
+      startX: number;
+      startY: number;
+      origin: GraphPoint;
+    }
+  | {
+      type: "cluster";
+      clusterId: string;
       startX: number;
       startY: number;
       origin: GraphPoint;
@@ -92,10 +100,12 @@ export function SkillGraph({
   const [zoom, setZoom] = useState(1);
   const [panOffset, setPanOffset] = useState<GraphPoint>({ x: 0, y: 0 });
   const [dragOffsets, setDragOffsets] = useState<Record<string, GraphPoint>>({});
+  const [clusterOffsets, setClusterOffsets] = useState<Record<string, GraphPoint>>({});
   const svgRef = useRef<SVGSVGElement>(null);
   const activeDragRef = useRef<ActiveDrag | undefined>(undefined);
   const panOffsetRef = useRef(panOffset);
   const dragOffsetsRef = useRef(dragOffsets);
+  const clusterOffsetsRef = useRef(clusterOffsets);
   const returnAnimationRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
@@ -104,6 +114,8 @@ export function SkillGraph({
     panOffsetRef.current = { x: 0, y: 0 };
     setDragOffsets({});
     dragOffsetsRef.current = {};
+    setClusterOffsets({});
+    clusterOffsetsRef.current = {};
     setSelection(null);
   }, [activeView]);
 
@@ -188,10 +200,15 @@ export function SkillGraph({
   const displayPoint = (skillId: string): GraphPoint => {
     const point = layout.nodePoints.get(skillId) ?? graphViewport.center;
     const offset = dragOffsets[skillId] ?? { x: 0, y: 0 };
+    const clusterId = nodesById.get(skillId)?.clusterId;
+    const clusterOffset = clusterId ? clusterOffsets[clusterId] ?? { x: 0, y: 0 } : { x: 0, y: 0 };
+    return { x: point.x + offset.x + clusterOffset.x, y: point.y + offset.y + clusterOffset.y };
+  };
+  const clusterPoint = (clusterId: string) => {
+    const point = layout.clusterPoints.get(clusterId) ?? graphViewport.center;
+    const offset = clusterOffsets[clusterId] ?? { x: 0, y: 0 };
     return { x: point.x + offset.x, y: point.y + offset.y };
   };
-  const clusterPoint = (clusterId: string) =>
-    layout.clusterPoints.get(clusterId) ?? graphViewport.center;
   const edgeFocusClass = (edge: SkillGraphEdge) => {
     const sourceCluster = nodesById.get(edge.sourceSkillId)?.clusterId;
     const targetCluster = nodesById.get(edge.targetSkillId)?.clusterId;
@@ -250,6 +267,23 @@ export function SkillGraph({
     };
   };
 
+  const beginClusterDrag = (
+    event: ReactPointerEvent<SVGGElement>,
+    clusterId: string,
+  ) => {
+    if (event.button !== 0) return;
+    event.stopPropagation();
+    closeTransientDetails();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    activeDragRef.current = {
+      type: "cluster",
+      clusterId,
+      startX: event.clientX,
+      startY: event.clientY,
+      origin: clusterOffsetsRef.current[clusterId] ?? { x: 0, y: 0 },
+    };
+  };
+
   const moveDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
     const drag = activeDragRef.current;
     const svg = svgRef.current;
@@ -270,6 +304,18 @@ export function SkillGraph({
       return;
     }
     if (!graph) return;
+    if (drag.type === "cluster") {
+      const nextClusterOffsets = propagateClusterDragOffsets(
+        graph,
+        layout,
+        drag.clusterId,
+        { x: drag.origin.x + dx, y: drag.origin.y + dy },
+        clusterOffsetsRef.current,
+      );
+      clusterOffsetsRef.current = nextClusterOffsets;
+      setClusterOffsets(nextClusterOffsets);
+      return;
+    }
     const nextOffsets = propagateDragOffsets(
       graph,
       layout,
@@ -297,6 +343,7 @@ export function SkillGraph({
         y: panOffsetRef.current.y * 0.78,
       };
       const nextOffsets: Record<string, GraphPoint> = {};
+      const nextClusterOffsets: Record<string, GraphPoint> = {};
       let moving = Math.hypot(nextPan.x, nextPan.y) > 0.25;
       for (const [skillId, offset] of Object.entries(dragOffsetsRef.current)) {
         const next = { x: offset.x * 0.78, y: offset.y * 0.78 };
@@ -305,10 +352,19 @@ export function SkillGraph({
           moving = true;
         }
       }
+      for (const [clusterId, offset] of Object.entries(clusterOffsetsRef.current)) {
+        const next = { x: offset.x * 0.78, y: offset.y * 0.78 };
+        if (Math.hypot(next.x, next.y) > 0.25) {
+          nextClusterOffsets[clusterId] = next;
+          moving = true;
+        }
+      }
       panOffsetRef.current = moving ? nextPan : { x: 0, y: 0 };
       dragOffsetsRef.current = moving ? nextOffsets : {};
+      clusterOffsetsRef.current = moving ? nextClusterOffsets : {};
       setPanOffset(panOffsetRef.current);
       setDragOffsets(dragOffsetsRef.current);
+      setClusterOffsets(clusterOffsetsRef.current);
       if (moving) {
         returnAnimationRef.current = requestAnimationFrame(step);
       }
@@ -356,6 +412,7 @@ export function SkillGraph({
                     tabIndex={0}
                     role="button"
                     aria-label={`${cluster.name} 集群`}
+                    onPointerDown={(event) => beginClusterDrag(event, cluster.clusterId)}
                     onDoubleClick={(event) => {
                       event.stopPropagation();
                       setSelection({ type: "cluster", clusterId: cluster.clusterId });
