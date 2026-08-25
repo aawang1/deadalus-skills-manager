@@ -10,15 +10,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const VISUAL_SIMILARITY_THRESHOLD: f32 = 0.72;
 pub const VISUAL_EDGE_TOP_K: usize = 5;
+pub const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.78;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillGraphSnapshot {
     pub graph_version: String,
+    pub layout_version: String,
     pub profile_id: Option<String>,
     pub view_id: String,
     pub nodes: Vec<SkillGraphNode>,
+    pub clusters: Vec<SkillGraphCluster>,
     pub edges: Vec<SkillGraphEdge>,
+    pub proximities: Vec<SkillGraphProximity>,
     pub excluded_unready_count: usize,
     pub excluded_unconnected_count: usize,
 }
@@ -31,6 +35,29 @@ pub struct SkillGraphNode {
     pub description: Option<String>,
     pub path: String,
     pub enabled_agents: Vec<String>,
+    pub cluster_id: Option<String>,
+    pub centrality: f32,
+    pub superseded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillGraphCluster {
+    pub cluster_id: String,
+    pub name: String,
+    pub summary: String,
+    pub member_skill_ids: Vec<String>,
+    pub core_skill_ids: Vec<String>,
+    pub peripheral: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillGraphProximity {
+    pub source_skill_id: String,
+    pub target_skill_id: String,
+    pub weight: f32,
+    pub relationship_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -75,10 +102,13 @@ struct EdgeCandidate {
 pub fn empty_graph(view_id: &str) -> SkillGraphSnapshot {
     SkillGraphSnapshot {
         graph_version: format!("no-active-profile:{view_id}"),
+        layout_version: format!("no-active-profile:{view_id}"),
         profile_id: None,
         view_id: view_id.to_string(),
         nodes: Vec::new(),
+        clusters: Vec::new(),
         edges: Vec::new(),
+        proximities: Vec::new(),
         excluded_unready_count: 0,
         excluded_unconnected_count: 0,
     }
@@ -155,39 +185,58 @@ pub fn build_skill_graph(
         }
     }
 
-    let connected_ids = similarities
-        .iter()
-        .flat_map(|pair| [&pair.source, &pair.target])
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let excluded_unconnected_count = ready_skills.len().saturating_sub(connected_ids.len());
+    let excluded_unconnected_count = 0;
+    let (clusters, cluster_by_skill, centrality_by_skill) =
+        build_clusters(&ready_skills, &similarities);
+    let superseded_ids = confirmed_superseded_ids(&relevant_relationships);
     let nodes = ready_skills
         .values()
-        .map(|(skill, _)| graph_node(skill))
+        .map(|(skill, _)| {
+            graph_node(
+                skill,
+                cluster_by_skill.get(&skill.skill_id).cloned(),
+                *centrality_by_skill.get(&skill.skill_id).unwrap_or(&0.0),
+                superseded_ids.contains(&skill.skill_id),
+            )
+        })
         .collect::<Vec<_>>();
     let node_ids = nodes
         .iter()
         .map(|node| node.skill_id.clone())
         .collect::<HashSet<_>>();
 
-    let stored_by_pair =
-        stored_relations_by_pair(&relevant_relationships, &node_ids, &conflict_pairs);
-    let nearest_by_node = nearest_pairs(&similarities, &node_ids);
+    let visible_stored_by_pair = stored_relations_by_pair(
+        &relevant_relationships,
+        &node_ids,
+        &conflict_pairs,
+        visible_relationship,
+    );
+    let detail_relations_by_pair = stored_relations_by_pair(
+        &relevant_relationships,
+        &node_ids,
+        &conflict_pairs,
+        |kind| kind != RelationshipType::ConflictsWith,
+    );
+    let proximities = build_proximities(&relevant_relationships, &node_ids, &conflict_pairs);
     let mut candidates = BTreeMap::<(String, String), EdgeCandidate>::new();
     for pair in similarities
         .iter()
         .filter(|pair| node_ids.contains(&pair.source) && node_ids.contains(&pair.target))
     {
         let key = ordered_pair(&pair.source, &pair.target);
-        let stored = stored_by_pair.get(&key).cloned().unwrap_or_default();
-        let nearest_fallback = nearest_by_node.get(&pair.source) == Some(&key)
-            || nearest_by_node.get(&pair.target) == Some(&key);
-        if pair.score < VISUAL_SIMILARITY_THRESHOLD && stored.is_empty() && !nearest_fallback {
+        let visible_stored = visible_stored_by_pair
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        if pair.score < VISUAL_SIMILARITY_THRESHOLD && visible_stored.is_empty() {
             continue;
         }
-        let mut relations = stored;
-        if pair.score >= VISUAL_SIMILARITY_THRESHOLD || nearest_fallback {
-            relations.push(vector_similarity_relation(pair.score, nearest_fallback));
+        let mut relations = detail_relations_by_pair
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        if pair.score >= VISUAL_SIMILARITY_THRESHOLD {
+            relations.push(vector_similarity_relation(pair.score, false));
         }
         candidates.insert(
             key,
@@ -195,11 +244,9 @@ pub fn build_skill_graph(
                 source: pair.source.clone(),
                 target: pair.target.clone(),
                 similarity: pair.score,
-                has_stored_relation: !relations
-                    .iter()
-                    .all(|relation| relation.source == "vector_similarity"),
+                has_stored_relation: !visible_stored.is_empty(),
                 relations,
-                nearest_fallback: pair.score < VISUAL_SIMILARITY_THRESHOLD && nearest_fallback,
+                nearest_fallback: false,
             },
         );
     }
@@ -216,14 +263,25 @@ pub fn build_skill_graph(
             nearest_fallback: edge.nearest_fallback,
         })
         .collect::<Vec<_>>();
-    let graph_version = graph_version(profile_id, &nodes, &edges, &ready_skills);
+    let graph_version = graph_version(
+        profile_id,
+        &nodes,
+        &clusters,
+        &edges,
+        &proximities,
+        &ready_skills,
+    );
+    let layout_version = layout_version(profile_id, &nodes, &ready_skills);
 
     SkillGraphSnapshot {
         graph_version,
+        layout_version,
         profile_id: Some(profile_id.to_string()),
         view_id: view_id.to_string(),
         nodes,
+        clusters,
         edges,
+        proximities,
         excluded_unready_count,
         excluded_unconnected_count,
     }
@@ -252,13 +310,21 @@ fn ready_overall_vectors(vectors: &[StoredVector]) -> HashMap<String, &StoredVec
     selected
 }
 
-fn graph_node(skill: &CanonicalSkill) -> SkillGraphNode {
+fn graph_node(
+    skill: &CanonicalSkill,
+    cluster_id: Option<String>,
+    centrality: f32,
+    superseded: bool,
+) -> SkillGraphNode {
     SkillGraphNode {
         skill_id: skill.skill_id.clone(),
         name: skill.name.clone(),
         description: skill.description.clone(),
         path: skill.path.clone(),
         enabled_agents: skill.enabled_agents.clone(),
+        cluster_id,
+        centrality,
+        superseded,
     }
 }
 
@@ -286,11 +352,13 @@ fn stored_relations_by_pair(
     relationships: &[&SkillRelationship],
     node_ids: &HashSet<String>,
     conflict_pairs: &HashSet<(String, String)>,
+    include: fn(RelationshipType) -> bool,
 ) -> BTreeMap<(String, String), Vec<SkillGraphRelation>> {
     let mut grouped = BTreeMap::<_, Vec<_>>::new();
     for relation in relationships {
         let key = ordered_pair(&relation.source_skill_id, &relation.target_skill_id);
-        if conflict_pairs.contains(&key)
+        if !include(relation.relationship_type)
+            || conflict_pairs.contains(&key)
             || !node_ids.contains(&relation.source_skill_id)
             || !node_ids.contains(&relation.target_skill_id)
         {
@@ -308,28 +376,216 @@ fn stored_relations_by_pair(
     grouped
 }
 
-fn nearest_pairs(
-    similarities: &[PairSimilarity],
+fn visible_relationship(kind: RelationshipType) -> bool {
+    matches!(
+        kind,
+        RelationshipType::SimilarTo | RelationshipType::DependsOn | RelationshipType::LocatedIn
+    )
+}
+
+fn weak_relationship(kind: RelationshipType) -> bool {
+    matches!(
+        kind,
+        RelationshipType::OverlapsWith
+            | RelationshipType::ReadsReference
+            | RelationshipType::RunsScript
+            | RelationshipType::UsesAsset
+            | RelationshipType::Supersedes
+            | RelationshipType::DuplicateCandidate
+    )
+}
+
+fn confirmed_superseded_ids(relationships: &[&SkillRelationship]) -> HashSet<String> {
+    relationships
+        .iter()
+        .filter(|relation| relation.relationship_type == RelationshipType::Supersedes)
+        .filter(|relation| {
+            matches!(
+                relation.state,
+                RelationshipState::HumanConfirmed
+                    | RelationshipState::Revalidated
+                    | RelationshipState::CarriedFact
+            )
+        })
+        .map(|relation| relation.target_skill_id.clone())
+        .collect()
+}
+
+fn build_proximities(
+    relationships: &[&SkillRelationship],
     node_ids: &HashSet<String>,
-) -> HashMap<String, (String, String)> {
-    let mut nearest = HashMap::<String, (&PairSimilarity, f32)>::new();
+    conflict_pairs: &HashSet<(String, String)>,
+) -> Vec<SkillGraphProximity> {
+    let mut grouped = BTreeMap::<(String, String), (f32, BTreeSet<String>)>::new();
+    for relation in relationships.iter().filter(|relation| {
+        weak_relationship(relation.relationship_type)
+            && node_ids.contains(&relation.source_skill_id)
+            && node_ids.contains(&relation.target_skill_id)
+    }) {
+        let key = ordered_pair(&relation.source_skill_id, &relation.target_skill_id);
+        if conflict_pairs.contains(&key) {
+            continue;
+        }
+        let default_weight = match relation.relationship_type {
+            RelationshipType::OverlapsWith => 0.55,
+            RelationshipType::Supersedes | RelationshipType::DuplicateCandidate => 0.4,
+            _ => 0.22,
+        };
+        let entry = grouped.entry(key).or_default();
+        entry.0 = (entry.0 + relation.score.unwrap_or(default_weight) as f32).min(1.0);
+        entry
+            .1
+            .insert(relation.relationship_type.as_str().to_string());
+    }
+    grouped
+        .into_iter()
+        .map(
+            |((source_skill_id, target_skill_id), (weight, kinds))| SkillGraphProximity {
+                source_skill_id,
+                target_skill_id,
+                weight,
+                relationship_types: kinds.into_iter().collect(),
+            },
+        )
+        .collect()
+}
+
+fn build_clusters(
+    ready_skills: &BTreeMap<String, (&CanonicalSkill, &StoredVector)>,
+    similarities: &[PairSimilarity],
+) -> (
+    Vec<SkillGraphCluster>,
+    HashMap<String, String>,
+    HashMap<String, f32>,
+) {
+    let mut adjacency = ready_skills
+        .keys()
+        .map(|id| (id.clone(), Vec::<String>::new()))
+        .collect::<HashMap<_, _>>();
     for pair in similarities
         .iter()
-        .filter(|pair| node_ids.contains(&pair.source) && node_ids.contains(&pair.target))
+        .filter(|pair| pair.score >= CLUSTER_SIMILARITY_THRESHOLD)
     {
-        for skill_id in [&pair.source, &pair.target] {
-            let replace = nearest
-                .get(skill_id)
-                .is_none_or(|(_, score)| pair.score > *score);
-            if replace {
-                nearest.insert(skill_id.clone(), (pair, pair.score));
+        adjacency
+            .entry(pair.source.clone())
+            .or_default()
+            .push(pair.target.clone());
+        adjacency
+            .entry(pair.target.clone())
+            .or_default()
+            .push(pair.source.clone());
+    }
+
+    let mut visited = HashSet::new();
+    let mut components = Vec::<Vec<String>>::new();
+    for skill_id in ready_skills.keys() {
+        if !visited.insert(skill_id.clone()) {
+            continue;
+        }
+        let mut stack = vec![skill_id.clone()];
+        let mut members = Vec::new();
+        while let Some(current) = stack.pop() {
+            members.push(current.clone());
+            for neighbor in adjacency.get(&current).into_iter().flatten() {
+                if visited.insert(neighbor.clone()) {
+                    stack.push(neighbor.clone());
+                }
+            }
+        }
+        members.sort();
+        components.push(members);
+    }
+
+    let mut cluster_by_skill = HashMap::new();
+    let mut centrality_by_skill = HashMap::new();
+    let mut clusters = Vec::new();
+    for members in components.into_iter().filter(|members| members.len() >= 2) {
+        let cluster_id = format!(
+            "cluster_{}",
+            &stable_hash(members.join("\0").as_bytes())[..20]
+        );
+        let member_set = members.iter().cloned().collect::<HashSet<_>>();
+        for member in &members {
+            let scores = similarities
+                .iter()
+                .filter(|pair| {
+                    (pair.source == *member && member_set.contains(&pair.target))
+                        || (pair.target == *member && member_set.contains(&pair.source))
+                })
+                .map(|pair| pair.score)
+                .collect::<Vec<_>>();
+            let centrality = if scores.is_empty() {
+                0.0
+            } else {
+                scores.iter().sum::<f32>() / scores.len() as f32
+            };
+            centrality_by_skill.insert(member.clone(), centrality);
+            cluster_by_skill.insert(member.clone(), cluster_id.clone());
+        }
+        let core_count = ((members.len() as f32).sqrt().ceil() as usize).clamp(2, 4);
+        let mut ranked = members.clone();
+        ranked.sort_by(|left, right| {
+            centrality_by_skill[right]
+                .partial_cmp(&centrality_by_skill[left])
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+        let skills = members
+            .iter()
+            .filter_map(|id| ready_skills.get(id).map(|(skill, _)| *skill))
+            .collect::<Vec<_>>();
+        clusters.push(SkillGraphCluster {
+            cluster_id,
+            name: cluster_name(&skills),
+            summary: cluster_summary(&skills),
+            member_skill_ids: members,
+            core_skill_ids: ranked.into_iter().take(core_count).collect(),
+            peripheral: false,
+        });
+    }
+    clusters.sort_by(|left, right| left.cluster_id.cmp(&right.cluster_id));
+    (clusters, cluster_by_skill, centrality_by_skill)
+}
+
+fn cluster_name(skills: &[&CanonicalSkill]) -> String {
+    let stop_words = [
+        "skill", "skills", "tool", "agent", "the", "and", "for", "with",
+    ];
+    let mut counts = BTreeMap::<String, usize>::new();
+    for skill in skills {
+        for token in skill
+            .name
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| token.chars().count() >= 2)
+        {
+            let normalized = token.to_lowercase();
+            if !stop_words.contains(&normalized.as_str()) {
+                *counts.entry(normalized).or_default() += 1;
             }
         }
     }
-    nearest
+    counts
         .into_iter()
-        .map(|(skill_id, (pair, _))| (skill_id, ordered_pair(&pair.source, &pair.target)))
-        .collect()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(token, _)| token)
+        .or_else(|| skills.first().map(|skill| skill.name.clone()))
+        .unwrap_or_else(|| "功能集群".to_string())
+}
+
+fn cluster_summary(skills: &[&CanonicalSkill]) -> String {
+    let descriptions = skills
+        .iter()
+        .filter_map(|skill| skill.description.as_deref())
+        .filter(|description| !description.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+    if descriptions.is_empty() {
+        format!("包含 {} 个功能相近的 Skills。", skills.len())
+    } else {
+        let joined = descriptions.join("；");
+        let summary = joined.chars().take(180).collect::<String>();
+        format!("{} 个 Skills：{}", skills.len(), summary)
+    }
 }
 
 fn vector_similarity_relation(score: f32, fallback: bool) -> SkillGraphRelation {
@@ -430,7 +686,9 @@ fn select_top_k(
 fn graph_version(
     profile_id: &str,
     nodes: &[SkillGraphNode],
+    clusters: &[SkillGraphCluster],
     edges: &[SkillGraphEdge],
+    proximities: &[SkillGraphProximity],
     ready_skills: &BTreeMap<String, (&CanonicalSkill, &StoredVector)>,
 ) -> String {
     let mut parts = vec![profile_id.to_string()];
@@ -447,6 +705,16 @@ fn graph_version(
             node.path,
             node.enabled_agents.join(","),
             vector_version,
+        ));
+    }
+    for cluster in clusters {
+        parts.push(format!(
+            "{}:{}:{}:{}:{}",
+            cluster.cluster_id,
+            cluster.name,
+            cluster.summary,
+            cluster.member_skill_ids.join(","),
+            cluster.core_skill_ids.join(","),
         ));
     }
     for edge in edges {
@@ -468,6 +736,31 @@ fn graph_version(
                 relation.evidence,
             ));
         }
+    }
+    for proximity in proximities {
+        parts.push(format!(
+            "{}:{}:{}:{}",
+            proximity.source_skill_id,
+            proximity.target_skill_id,
+            proximity.weight.to_bits(),
+            proximity.relationship_types.join(","),
+        ));
+    }
+    stable_hash(parts.join("\n").as_bytes())
+}
+
+fn layout_version(
+    profile_id: &str,
+    nodes: &[SkillGraphNode],
+    ready_skills: &BTreeMap<String, (&CanonicalSkill, &StoredVector)>,
+) -> String {
+    let mut parts = vec![profile_id.to_string()];
+    for node in nodes {
+        let vector_version = ready_skills
+            .get(&node.skill_id)
+            .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
+            .unwrap_or_default();
+        parts.push(format!("{}:{}", node.skill_id, vector_version));
     }
     stable_hash(parts.join("\n").as_bytes())
 }
@@ -566,8 +859,30 @@ mod tests {
         }
     }
 
+    fn relation(
+        left: &str,
+        right: &str,
+        relationship_type: RelationshipType,
+        state: RelationshipState,
+    ) -> SkillRelationship {
+        SkillRelationship {
+            relation_id: format!("relation-{left}-{right}-{}", relationship_type.as_str()),
+            source_skill_id: left.to_string(),
+            target_skill_id: right.to_string(),
+            relationship_type,
+            vector_type: None,
+            source_profile_id: Some("profile".to_string()),
+            target_profile_id: Some("profile".to_string()),
+            score: Some(0.8),
+            state,
+            evidence: Value::Null,
+            created_at: 1,
+            validated_at: None,
+        }
+    }
+
     #[test]
-    fn every_visible_node_gets_a_non_conflicting_similarity_edge() {
+    fn only_over_threshold_non_conflicting_pairs_get_similarity_edges() {
         let graph = build_skill_graph(
             &snapshot(vec![
                 skill("a", "cursor"),
@@ -584,17 +899,20 @@ mod tests {
             "cursor",
         );
         assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.edges.len(), 1);
+        assert!(graph.edges[0]
+            .relations
+            .iter()
+            .any(|relation| relation.source == "vector_similarity"));
+        assert!(!graph.edges[0].nearest_fallback);
+        assert_eq!(graph.clusters.len(), 1);
         assert!(graph
             .nodes
             .iter()
-            .all(|node| graph.edges.iter().any(|edge| {
-                (edge.source_skill_id == node.skill_id || edge.target_skill_id == node.skill_id)
-                    && edge
-                        .relations
-                        .iter()
-                        .any(|relation| relation.source == "vector_similarity")
-            })));
-        assert!(graph.edges.iter().any(|edge| edge.nearest_fallback));
+            .find(|node| node.skill_id == "c")
+            .unwrap()
+            .cluster_id
+            .is_none());
     }
 
     #[test]
@@ -608,7 +926,8 @@ mod tests {
         );
         assert_eq!(graph.nodes.len(), 2);
         assert!(graph.edges.is_empty());
-        assert_eq!(graph.excluded_unconnected_count, 2);
+        assert_eq!(graph.excluded_unconnected_count, 0);
+        assert!(graph.clusters.is_empty());
     }
 
     #[test]
@@ -633,21 +952,92 @@ mod tests {
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].skill_id, "a");
         assert_eq!(graph.excluded_unready_count, 1);
-        assert_eq!(graph.excluded_unconnected_count, 1);
+        assert_eq!(graph.excluded_unconnected_count, 0);
     }
 
     #[test]
     fn a_single_ready_agent_skill_remains_visible_without_an_edge() {
         let graph = build_skill_graph(
-            &snapshot(vec![skill("claude", "claude-code"), skill("codex", "codex")]),
+            &snapshot(vec![
+                skill("claude", "claude-code"),
+                skill("codex", "codex"),
+            ]),
             "profile",
-            &[vector("claude", vec![1.0, 0.0]), vector("codex", vec![0.0, 1.0])],
+            &[
+                vector("claude", vec![1.0, 0.0]),
+                vector("codex", vec![0.0, 1.0]),
+            ],
             &[],
             "claude-code",
         );
         assert_eq!(graph.nodes.len(), 1);
         assert_eq!(graph.nodes[0].skill_id, "claude");
         assert!(graph.edges.is_empty());
-        assert_eq!(graph.excluded_unconnected_count, 1);
+        assert_eq!(graph.excluded_unconnected_count, 0);
+        assert!(graph.nodes[0].cluster_id.is_none());
+    }
+
+    #[test]
+    fn weak_relations_move_nodes_without_creating_an_edge_and_remain_available_as_detail() {
+        let weak = relation(
+            "a",
+            "b",
+            RelationshipType::OverlapsWith,
+            RelationshipState::Revalidated,
+        );
+        let below_threshold = build_skill_graph(
+            &snapshot(vec![skill("a", "cursor"), skill("b", "cursor")]),
+            "profile",
+            &[vector("a", vec![1.0, 0.0]), vector("b", vec![0.0, 1.0])],
+            std::slice::from_ref(&weak),
+            "cursor",
+        );
+        assert!(below_threshold.edges.is_empty());
+        assert_eq!(below_threshold.proximities.len(), 1);
+
+        let over_threshold = build_skill_graph(
+            &snapshot(vec![skill("a", "cursor"), skill("b", "cursor")]),
+            "profile",
+            &[vector("a", vec![1.0, 0.0]), vector("b", vec![0.9, 0.1])],
+            &[weak],
+            "cursor",
+        );
+        assert_eq!(over_threshold.edges.len(), 1);
+        assert!(over_threshold.edges[0]
+            .relations
+            .iter()
+            .any(|item| item.relationship_type == "overlaps_with"));
+    }
+
+    #[test]
+    fn confirmed_supersedes_dims_only_the_replaced_target() {
+        let graph = build_skill_graph(
+            &snapshot(vec![skill("new", "cursor"), skill("old", "cursor")]),
+            "profile",
+            &[vector("new", vec![1.0, 0.0]), vector("old", vec![0.9, 0.1])],
+            &[relation(
+                "new",
+                "old",
+                RelationshipType::Supersedes,
+                RelationshipState::HumanConfirmed,
+            )],
+            "cursor",
+        );
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "new")
+                .unwrap()
+                .superseded
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "old")
+                .unwrap()
+                .superseded
+        );
     }
 }

@@ -284,10 +284,13 @@ export interface SkillRelationship {
 
 export interface SkillGraphSnapshot {
   graphVersion: string;
+  layoutVersion: string;
   profileId?: string;
   viewId: ViewId;
   nodes: SkillGraphNode[];
+  clusters: SkillGraphCluster[];
   edges: SkillGraphEdge[];
+  proximities: SkillGraphProximity[];
   excludedUnreadyCount: number;
   excludedUnconnectedCount: number;
 }
@@ -298,6 +301,25 @@ export interface SkillGraphNode {
   description?: string;
   path: string;
   enabledAgents: AgentId[];
+  clusterId?: string;
+  centrality: number;
+  superseded: boolean;
+}
+
+export interface SkillGraphCluster {
+  clusterId: string;
+  name: string;
+  summary: string;
+  memberSkillIds: string[];
+  coreSkillIds: string[];
+  peripheral: boolean;
+}
+
+export interface SkillGraphProximity {
+  sourceSkillId: string;
+  targetSkillId: string;
+  weight: number;
+  relationshipTypes: RelationshipType[];
 }
 
 export interface SkillGraphEdge {

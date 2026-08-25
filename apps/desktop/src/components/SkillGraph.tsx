@@ -9,6 +9,7 @@ import {
 import { api } from "../api";
 import type {
   SkillGraphEdge,
+  SkillGraphCluster,
   SkillGraphNode,
   SkillGraphSnapshot,
   SkillGraphRelation,
@@ -30,6 +31,7 @@ interface SkillGraphProps {
 type Selection =
   | { type: "node"; nodeId: string }
   | { type: "edge"; edgeId: string }
+  | { type: "cluster"; clusterId: string }
   | null;
 
 type ActiveDrag =
@@ -117,11 +119,22 @@ export function SkillGraph({
       .getSkillGraph(activeView)
       .then((nextGraph) => {
         if (!current) return;
+        const normalizedGraph: SkillGraphSnapshot = {
+          ...nextGraph,
+          layoutVersion: nextGraph.layoutVersion ?? nextGraph.graphVersion,
+          clusters: nextGraph.clusters ?? [],
+          proximities: nextGraph.proximities ?? [],
+          nodes: nextGraph.nodes.map((node) => ({
+            ...node,
+            centrality: node.centrality ?? 0,
+            superseded: node.superseded ?? false,
+          })),
+        };
         setGraph((previous) =>
-          previous?.graphVersion === nextGraph.graphVersion &&
-          previous.viewId === nextGraph.viewId
+          previous?.graphVersion === normalizedGraph.graphVersion &&
+          previous.viewId === normalizedGraph.viewId
             ? previous
-            : nextGraph,
+            : normalizedGraph,
         );
         setState("ready");
       })
@@ -147,12 +160,12 @@ export function SkillGraph({
   const layout = useMemo(
     () =>
       graph
-        ? getSkillGraphLayout(
-            `${graph.viewId}:${graph.graphVersion}`,
-            graph.nodes,
-            graph.edges,
-          )
-        : new Map<string, GraphPoint>(),
+        ? getSkillGraphLayout(`${graph.viewId}:${graph.layoutVersion}`, graph)
+        : {
+            nodePoints: new Map<string, GraphPoint>(),
+            clusterPoints: new Map<string, GraphPoint>(),
+            clusterRadii: new Map<string, number>(),
+          },
     [graph],
   );
   const nodesById = useMemo(
@@ -166,11 +179,36 @@ export function SkillGraph({
     selection?.type === "edge"
       ? graph?.edges.find((edge) => edge.edgeId === selection.edgeId)
       : undefined;
+  const selectedCluster =
+    selection?.type === "cluster"
+      ? graph?.clusters.find((cluster) => cluster.clusterId === selection.clusterId)
+      : undefined;
 
   const displayPoint = (skillId: string): GraphPoint => {
-    const point = layout.get(skillId) ?? graphViewport.center;
+    const point = layout.nodePoints.get(skillId) ?? graphViewport.center;
     const offset = dragOffsets[skillId] ?? { x: 0, y: 0 };
     return { x: point.x + offset.x, y: point.y + offset.y };
+  };
+  const clusterPoint = (clusterId: string) =>
+    layout.clusterPoints.get(clusterId) ?? graphViewport.center;
+  const edgeFocusClass = (edge: SkillGraphEdge) => {
+    const sourceCluster = nodesById.get(edge.sourceSkillId)?.clusterId;
+    const targetCluster = nodesById.get(edge.targetSkillId)?.clusterId;
+    const classes = [sourceCluster !== targetCluster ? "is-cross-cluster" : ""];
+    if (selectedNode) {
+      classes.push(
+        edge.sourceSkillId === selectedNode.skillId || edge.targetSkillId === selectedNode.skillId
+          ? "is-focused"
+          : "is-muted",
+      );
+    } else if (selectedCluster) {
+      classes.push(
+        sourceCluster === selectedCluster.clusterId && targetCluster === selectedCluster.clusterId
+          ? "is-focused"
+          : "is-muted",
+      );
+    }
+    return classes.filter(Boolean).join(" ");
   };
 
   const closeTransientDetails = () => setSelection(null);
@@ -293,6 +331,43 @@ export function SkillGraph({
         onPointerCancel={endDrag}
       >
         <g transform={graphTransform}>
+          <g className="skill-graph__clusters">
+            {(graph?.clusters ?? []).map((cluster) => {
+              const point = clusterPoint(cluster.clusterId);
+              const radius = layout.clusterRadii.get(cluster.clusterId) ?? 100;
+              return (
+                <g
+                  key={cluster.clusterId}
+                  className={`skill-graph__cluster${selectedCluster && selectedCluster.clusterId !== cluster.clusterId ? " is-muted" : ""}`}
+                >
+                  <circle className="skill-graph__cluster-cloud" cx={point.x} cy={point.y} r={radius} />
+                  {cluster.coreSkillIds.map((skillId) => {
+                    const target = displayPoint(skillId);
+                    return <line key={skillId} className="skill-graph__core-link" x1={point.x} y1={point.y} x2={target.x} y2={target.y} />;
+                  })}
+                  <g
+                    className="skill-graph__cluster-center"
+                    transform={`translate(${point.x} ${point.y})`}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`${cluster.name} 集群`}
+                    onDoubleClick={(event) => {
+                      event.stopPropagation();
+                      setSelection({ type: "cluster", clusterId: cluster.clusterId });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      setSelection({ type: "cluster", clusterId: cluster.clusterId });
+                    }}
+                  >
+                    <circle r="17" />
+                    <text textAnchor="middle" dominantBaseline="middle">{shortLabel(cluster.name, 10)}</text>
+                  </g>
+                </g>
+              );
+            })}
+          </g>
           <g className="skill-graph__edges">
             {(graph?.edges ?? []).map((edge) => (
               <GraphEdge
@@ -301,6 +376,7 @@ export function SkillGraph({
                 source={displayPoint(edge.sourceSkillId)}
                 target={displayPoint(edge.targetSkillId)}
                 expanded={selectedEdge?.edgeId === edge.edgeId}
+                className={edgeFocusClass(edge)}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
                   setSelection({ type: "edge", edgeId: edge.edgeId });
@@ -309,23 +385,13 @@ export function SkillGraph({
             ))}
           </g>
 
-          <g
-            className="skill-graph__center"
-            transform={`translate(${graphViewport.center.x} ${graphViewport.center.y})`}
-          >
-            <circle r="31" />
-            <text textAnchor="middle" dominantBaseline="middle">
-              {viewLabels[activeView]}
-            </text>
-          </g>
-
           <g className="skill-graph__nodes">
             {(graph?.nodes ?? []).map((node, index) => {
               const point = displayPoint(node.skillId);
               return (
                 <g
                   key={node.skillId}
-                  className="skill-graph__node"
+                  className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`}
                   transform={`translate(${point.x} ${point.y})`}
                   tabIndex={0}
                   role="button"
@@ -374,6 +440,13 @@ export function SkillGraph({
               onPointerDown={(event) => event.stopPropagation()}
             />
           )}
+          {selectedCluster && (
+            <ClusterPopup
+              cluster={selectedCluster}
+              point={clusterPoint(selectedCluster.clusterId)}
+              onPointerDown={(event) => event.stopPropagation()}
+            />
+          )}
         </g>
       </svg>
 
@@ -413,12 +486,14 @@ function GraphEdge({
   source,
   target,
   expanded,
+  className,
   onDoubleClick,
 }: {
   edge: SkillGraphEdge;
   source: GraphPoint;
   target: GraphPoint;
   expanded: boolean;
+  className: string;
   onDoubleClick: (event: ReactPointerEvent<SVGLineElement>) => void;
 }) {
   const lineCount = expanded ? Math.max(1, edge.relations.length) : 1;
@@ -427,7 +502,7 @@ function GraphEdge({
   const distance = Math.max(1, Math.hypot(dx, dy));
   const normal = { x: -dy / distance, y: dx / distance };
   return (
-    <g className={`skill-graph__edge ${expanded ? "is-expanded" : ""}`}>
+    <g className={`skill-graph__edge ${expanded ? "is-expanded" : ""} ${className}`}>
       {Array.from({ length: lineCount }, (_, index) => {
         const offset = parallelEdgeOffset(index, lineCount);
         const coordinates = {
@@ -527,6 +602,35 @@ function NodePopup({
   );
 }
 
+function ClusterPopup({
+  cluster,
+  point,
+  onPointerDown,
+}: {
+  cluster: SkillGraphCluster;
+  point: GraphPoint;
+  onPointerDown: (event: ReactPointerEvent<SVGForeignObjectElement>) => void;
+}) {
+  const popupX = Math.min(graphViewport.width - 274, Math.max(12, point.x + 20));
+  const popupY = Math.min(graphViewport.height - 170, Math.max(12, point.y - 30));
+  return (
+    <foreignObject
+      className="skill-graph__popup-shell"
+      x={popupX}
+      y={popupY}
+      width="262"
+      height="158"
+      onPointerDown={onPointerDown}
+    >
+      <div className="skill-graph__popup">
+        <strong>{cluster.name}</strong>
+        <p>{cluster.summary}</p>
+        <small>{cluster.memberSkillIds.length} 个 Skills</small>
+      </div>
+    </foreignObject>
+  );
+}
+
 function relationLabel(relation: SkillGraphRelation): string {
   const base =
     relationLabels[relation.relationshipType] ?? relation.relationshipType;
@@ -538,6 +642,6 @@ function relationLabel(relation: SkillGraphRelation): string {
   return base;
 }
 
-function shortLabel(value: string): string {
-  return value.length > 18 ? `${value.slice(0, 17)}…` : value;
+function shortLabel(value: string, limit = 18): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }

@@ -13,10 +13,22 @@ vi.mock("../api", () => ({
 
 const graph = {
   graphVersion: "graph-a",
+  layoutVersion: "layout-a",
   profileId: "profile-a",
   viewId: "cursor" as const,
   excludedUnreadyCount: 0,
   excludedUnconnectedCount: 0,
+  clusters: [
+    {
+      clusterId: "cluster-dev",
+      name: "开发",
+      summary: "开发与测试能力",
+      memberSkillIds: ["a", "b"],
+      coreSkillIds: ["a", "b"],
+      peripheral: false,
+    },
+  ],
+  proximities: [],
   nodes: [
     {
       skillId: "a",
@@ -24,6 +36,9 @@ const graph = {
       description: "Reviews a change.",
       path: "C:/skills/a",
       enabledAgents: ["cursor" as const],
+      clusterId: "cluster-dev",
+      centrality: 0.92,
+      superseded: false,
     },
     {
       skillId: "b",
@@ -31,6 +46,9 @@ const graph = {
       description: "Tests a change.",
       path: "C:/skills/b",
       enabledAgents: ["cursor" as const],
+      clusterId: "cluster-dev",
+      centrality: 0.88,
+      superseded: false,
     },
   ],
   edges: [
@@ -91,5 +109,15 @@ describe("SkillGraph", () => {
     expect(screen.getByText("功能相似（向量过阈）")).toBeInTheDocument();
     expect(screen.getByText("前置或依赖")).toBeInTheDocument();
     expect(container.querySelectorAll(".skill-graph__edge-hit")).toHaveLength(2);
+  });
+
+  it("opens cluster summary on double click", async () => {
+    mocks.getSkillGraph.mockResolvedValue(graph);
+    const user = userEvent.setup();
+    render(<SkillGraph activeView="cursor" isNative refreshKey={0} />);
+
+    const cluster = await screen.findByRole("button", { name: "开发 集群" });
+    await user.dblClick(cluster);
+    expect(screen.getByText("开发与测试能力")).toBeInTheDocument();
   });
 });

@@ -725,6 +725,69 @@ select {
   stroke-width: 1.5;
 }
 
+.skill-graph__edge.is-cross-cluster .skill-graph__edge-line,
+.skill-graph__edge.is-cross-cluster .skill-graph__edge-flow {
+  opacity: 0.35;
+  stroke-dasharray: 4 8;
+}
+
+.skill-graph__edge.is-muted {
+  opacity: 0.12;
+}
+
+.skill-graph__edge.is-focused .skill-graph__edge-line,
+.skill-graph__edge.is-focused .skill-graph__edge-flow {
+  opacity: 1;
+  stroke: rgba(134, 188, 255, 0.9);
+  stroke-width: 1.7;
+}
+
+.skill-graph__cluster {
+  transition: opacity 180ms ease;
+}
+
+.skill-graph__cluster.is-muted,
+.skill-graph__node.is-muted {
+  opacity: 0.16;
+}
+
+.skill-graph__cluster-cloud {
+  fill: rgba(43, 91, 154, 0.025);
+  stroke: rgba(91, 136, 197, 0.11);
+  stroke-width: 1;
+  stroke-dasharray: 3 9;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.skill-graph__core-link {
+  stroke: rgba(103, 143, 198, 0.2);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.skill-graph__cluster-center {
+  outline: none;
+  cursor: pointer;
+  animation: skill-cluster-breathe 6.4s ease-in-out infinite alternate;
+}
+
+.skill-graph__cluster-center circle {
+  fill: #0a1019;
+  stroke: rgba(80, 137, 215, 0.58);
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+}
+
+.skill-graph__cluster-center text {
+  fill: #bed5f7;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 6px;
+  font-weight: 650;
+  pointer-events: none;
+}
+
 .skill-graph__center circle {
   fill: #0d1420;
   stroke: rgba(57, 132, 255, 0.62);
@@ -744,6 +807,15 @@ select {
 .skill-graph__node {
   outline: none;
   cursor: grab;
+}
+
+.skill-graph__node.is-superseded {
+  opacity: 0.55;
+}
+
+.skill-graph__node.is-superseded:hover,
+.skill-graph__node.is-superseded:focus-visible {
+  opacity: 0.9;
 }
 
 .skill-graph__node:active {
@@ -909,6 +981,11 @@ select {
   to {
     stroke-dashoffset: -28;
   }
+}
+
+@keyframes skill-cluster-breathe {
+  from { transform: scale(0.97); }
+  to { transform: scale(1.035); }
 }
 
 .assistant-platform {

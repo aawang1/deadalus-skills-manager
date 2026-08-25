@@ -1695,6 +1695,7 @@ fn get_skill_graph(
             "no-canonical-snapshot:{}",
             graph.profile_id.as_deref().unwrap()
         );
+        graph.layout_version = graph.graph_version.clone();
         return Ok(graph);
     };
     let vectors = database
