@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SkillGraphSnapshot } from "../types";
-import { calculateSkillGraphLayout, parallelEdgeOffset, propagateClusterDragOffsets, propagateDragOffsets } from "./skillGraphLayout";
+import { calculateDynamicClusterGeometry, calculateSkillGraphLayout, parallelEdgeOffset, propagateInteractiveDrag } from "./skillGraphLayout";
 
 const graph: SkillGraphSnapshot = {
   graphVersion: "graph",
@@ -43,49 +43,51 @@ describe("skill graph layout", () => {
 
   it("propagates a dragged node through springs and prevents overlap", () => {
     const layout = calculateSkillGraphLayout(graph);
-    const offsets = propagateDragOffsets(graph, layout, "a", { x: 140, y: 20 }, {});
-    expect(Math.hypot(offsets.a.x, offsets.a.y)).toBeGreaterThan(100);
-    expect(Math.hypot(offsets.b.x, offsets.b.y)).toBeGreaterThan(1);
+    const result = propagateInteractiveDrag(graph, layout, { type: "skill", id: "a", offset: { x: 140, y: 20 } }, {}, {});
+    expect(Math.hypot(result.nodeOffsets.a.x, result.nodeOffsets.a.y)).toBeGreaterThan(100);
+    expect(Math.hypot(result.nodeOffsets.b.x, result.nodeOffsets.b.y)).toBeGreaterThan(1);
+    expect(Math.hypot(result.centerOffsets["cluster-a"].x, result.centerOffsets["cluster-a"].y)).toBeGreaterThan(1);
 
     const positions = graph.nodes.map((node) => {
       const base = layout.nodePoints.get(node.skillId)!;
-      return { x: base.x + offsets[node.skillId].x, y: base.y + offsets[node.skillId].y };
+      return { x: base.x + result.nodeOffsets[node.skillId].x, y: base.y + result.nodeOffsets[node.skillId].y };
     });
     for (let left = 0; left < positions.length; left += 1) for (let right = left + 1; right < positions.length; right += 1) {
       expect(Math.hypot(positions[left].x - positions[right].x, positions[left].y - positions[right].y)).toBeGreaterThanOrEqual(61.7);
     }
   });
 
-  it("moves a whole cluster and pushes an overlapping cluster away", () => {
-    const twoClusters: SkillGraphSnapshot = {
-      ...graph,
-      graphVersion: "two-clusters",
-      layoutVersion: "two-clusters",
-      clusters: [
-        graph.clusters[0],
-        { clusterId: "cluster-b", name: "文档", summary: "文档能力", memberSkillIds: ["d", "e"], coreSkillIds: ["d", "e"], peripheral: false },
-      ],
-      nodes: [
-        ...graph.nodes,
-        { skillId: "d", name: "D", path: "C:/d", enabledAgents: ["cursor"], clusterId: "cluster-b", centrality: 0.9, superseded: false },
-        { skillId: "e", name: "E", path: "C:/e", enabledAgents: ["cursor"], clusterId: "cluster-b", centrality: 0.86, superseded: false },
-      ],
-    };
-    const layout = calculateSkillGraphLayout(twoClusters);
-    const first = layout.clusterPoints.get("cluster-a")!;
-    const second = layout.clusterPoints.get("cluster-b")!;
-    const offsets = propagateClusterDragOffsets(
-      twoClusters,
-      layout,
-      "cluster-a",
-      { x: second.x - first.x, y: second.y - first.y },
-      {},
+  it("drags a cluster center with the same spring physics without rigidly moving members", () => {
+    const layout = calculateSkillGraphLayout(graph);
+    const result = propagateInteractiveDrag(graph, layout, { type: "cluster", id: "cluster-a", offset: { x: 120, y: 30 } }, {}, {});
+    expect(Math.hypot(result.centerOffsets["cluster-a"].x, result.centerOffsets["cluster-a"].y)).toBeGreaterThan(100);
+    expect(Math.hypot(result.nodeOffsets.a.x, result.nodeOffsets.a.y)).toBeGreaterThan(1);
+    expect(result.nodeOffsets.a).not.toEqual(result.centerOffsets["cluster-a"]);
+    const centerBase = layout.clusterPoints.get("cluster-a")!;
+    const center = { x: centerBase.x + result.centerOffsets["cluster-a"].x, y: centerBase.y + result.centerOffsets["cluster-a"].y };
+    const geometry = calculateDynamicClusterGeometry(
+      graph.clusters[0].memberSkillIds.map((id) => {
+        const base = layout.nodePoints.get(id)!;
+        return { x: base.x + result.nodeOffsets[id].x, y: base.y + result.nodeOffsets[id].y };
+      }),
+      center,
     );
-    expect(Math.hypot(offsets["cluster-a"].x, offsets["cluster-a"].y)).toBeGreaterThan(1);
-    expect(Math.hypot(offsets["cluster-b"].x, offsets["cluster-b"].y)).toBeGreaterThan(1);
-    const movedFirst = { x: first.x + offsets["cluster-a"].x, y: first.y + offsets["cluster-a"].y };
-    const movedSecond = { x: second.x + offsets["cluster-b"].x, y: second.y + offsets["cluster-b"].y };
-    const minimum = layout.clusterRadii.get("cluster-a")! + layout.clusterRadii.get("cluster-b")! + 29;
-    expect(Math.hypot(movedFirst.x - movedSecond.x, movedFirst.y - movedSecond.y)).toBeGreaterThanOrEqual(minimum);
+    expect(Math.hypot(center.x - geometry.x, center.y - geometry.y)).toBeGreaterThan(1);
+    expect(graph.clusters[0].memberSkillIds.every((id) => {
+      const base = layout.nodePoints.get(id)!;
+      const point = { x: base.x + result.nodeOffsets[id].x, y: base.y + result.nodeOffsets[id].y };
+      return Math.hypot(point.x - geometry.x, point.y - geometry.y) + 19 <= geometry.radius;
+    })).toBe(true);
+  });
+
+  it("keeps the full peripheral node outside the dynamic cluster boundary", () => {
+    const layout = calculateSkillGraphLayout(graph);
+    const cluster = graph.clusters[0];
+    const geometry = calculateDynamicClusterGeometry(
+      cluster.memberSkillIds.map((id) => layout.nodePoints.get(id)!),
+      layout.clusterPoints.get(cluster.clusterId)!,
+    );
+    const peripheral = layout.nodePoints.get("c")!;
+    expect(Math.hypot(peripheral.x - geometry.x, peripheral.y - geometry.y)).toBeGreaterThanOrEqual(geometry.radius + 24.8);
   });
 });

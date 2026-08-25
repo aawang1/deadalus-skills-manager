@@ -7,11 +7,20 @@ export interface SkillGraphLayout {
   clusterRadii: Map<string, number>;
 }
 
+export interface InteractiveOffsets {
+  nodeOffsets: Record<string, GraphPoint>;
+  centerOffsets: Record<string, GraphPoint>;
+}
+
+export interface ClusterGeometry extends GraphPoint { radius: number }
+
 const WIDTH = 1200;
 const HEIGHT = 800;
 const CENTER = { x: WIDTH / 2, y: HEIGHT / 2 };
 const PADDING = 54;
 const NODE_GAP = 62;
+const NODE_VISUAL_RADIUS = 19;
+const CLUSTER_PADDING = 34;
 const layoutCache = new Map<string, SkillGraphLayout>();
 export const graphViewport = { width: WIDTH, height: HEIGHT, center: CENTER };
 
@@ -49,7 +58,175 @@ export function calculateSkillGraphLayout(graph: SkillGraphSnapshot): SkillGraph
   });
   refineClusterNodes(graph, nodePoints, clusterPoints, clusterRadii);
   resolveNodeCollisions(nodePoints);
+  ensurePeripheralLayoutOutside(graph, nodePoints, clusterPoints);
   return { nodePoints, clusterPoints, clusterRadii };
+}
+
+function ensurePeripheralLayoutOutside(
+  graph: SkillGraphSnapshot,
+  nodePoints: Map<string, GraphPoint>,
+  clusterPoints: Map<string, GraphPoint>,
+) {
+  const clustered = new Set(graph.clusters.flatMap((cluster) => cluster.memberSkillIds));
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (const node of graph.nodes.filter((item) => !clustered.has(item.skillId))) {
+      const point = nodePoints.get(node.skillId)!;
+      for (const cluster of graph.clusters) {
+        const geometry = calculateDynamicClusterGeometry(
+          cluster.memberSkillIds.map((id) => nodePoints.get(id)!).filter(Boolean),
+          clusterPoints.get(cluster.clusterId)!,
+        );
+        const delta = safeDelta(geometry, point, `initial-peripheral:${cluster.clusterId}:${node.skillId}`);
+        const minimum = geometry.radius + NODE_VISUAL_RADIUS + 6;
+        if (delta.distance < minimum) {
+          point.x = clamp(geometry.x + delta.x * minimum, PADDING, WIDTH - PADDING);
+          point.y = clamp(geometry.y + delta.y * minimum, PADDING, HEIGHT - PADDING);
+        }
+      }
+    }
+  }
+}
+
+export function calculateDynamicClusterGeometry(
+  memberPoints: GraphPoint[],
+  centerNodePoint: GraphPoint,
+): ClusterGeometry {
+  const points = [...memberPoints, centerNodePoint];
+  if (points.length === 0) return { ...CENTER, radius: 96 };
+  const minimumX = Math.min(...points.map((point) => point.x));
+  const maximumX = Math.max(...points.map((point) => point.x));
+  const minimumY = Math.min(...points.map((point) => point.y));
+  const maximumY = Math.max(...points.map((point) => point.y));
+  const center = { x: (minimumX + maximumX) / 2, y: (minimumY + maximumY) / 2 };
+  const radius = Math.max(
+    72,
+    ...points.map((point) => Math.hypot(point.x - center.x, point.y - center.y) + CLUSTER_PADDING),
+  );
+  return { ...center, radius };
+}
+
+export function propagateInteractiveDrag(
+  graph: SkillGraphSnapshot,
+  layout: SkillGraphLayout,
+  dragged: { type: "skill" | "cluster"; id: string; offset: GraphPoint },
+  previousNodeOffsets: Record<string, GraphPoint>,
+  previousCenterOffsets: Record<string, GraphPoint>,
+): InteractiveOffsets {
+  const skillKey = (id: string) => `skill:${id}`;
+  const centerKey = (id: string) => `center:${id}`;
+  const positions = new Map<string, GraphPoint>();
+  const bases = new Map<string, GraphPoint>();
+  for (const node of graph.nodes) {
+    const base = layout.nodePoints.get(node.skillId) ?? CENTER;
+    const offset = previousNodeOffsets[node.skillId] ?? { x: 0, y: 0 };
+    bases.set(skillKey(node.skillId), base);
+    positions.set(skillKey(node.skillId), { x: base.x + offset.x, y: base.y + offset.y });
+  }
+  for (const cluster of graph.clusters) {
+    const base = layout.clusterPoints.get(cluster.clusterId) ?? CENTER;
+    const offset = previousCenterOffsets[cluster.clusterId] ?? { x: 0, y: 0 };
+    bases.set(centerKey(cluster.clusterId), base);
+    positions.set(centerKey(cluster.clusterId), { x: base.x + offset.x, y: base.y + offset.y });
+  }
+  const fixedKey = dragged.type === "skill" ? skillKey(dragged.id) : centerKey(dragged.id);
+  const fixedBase = bases.get(fixedKey) ?? CENTER;
+  const fixedTarget = {
+    x: clamp(fixedBase.x + dragged.offset.x, PADDING, WIDTH - PADDING),
+    y: clamp(fixedBase.y + dragged.offset.y, PADDING, HEIGHT - PADDING),
+  };
+  positions.set(fixedKey, fixedTarget);
+
+  const springs: Array<{ source: string; target: string; strength: number; rest: number }> = [];
+  const addSpring = (source: string, target: string, strength: number) => {
+    const sourceBase = bases.get(source);
+    const targetBase = bases.get(target);
+    if (!sourceBase || !targetBase) return;
+    springs.push({ source, target, strength, rest: Math.max(48, Math.hypot(targetBase.x - sourceBase.x, targetBase.y - sourceBase.y)) });
+  };
+  graph.edges.forEach((edge) => addSpring(skillKey(edge.sourceSkillId), skillKey(edge.targetSkillId), 0.2));
+  graph.proximities.forEach((relation) => addSpring(skillKey(relation.sourceSkillId), skillKey(relation.targetSkillId), 0.03 + relation.weight * 0.05));
+  graph.clusters.forEach((cluster) => cluster.coreSkillIds.forEach((skillId) => addSpring(centerKey(cluster.clusterId), skillKey(skillId), 0.24)));
+
+  for (let iteration = 0; iteration < 16; iteration += 1) {
+    const forces = new Map([...positions.keys()].map((key) => [key, { x: 0, y: 0 }]));
+    for (const spring of springs) {
+      const source = positions.get(spring.source)!;
+      const target = positions.get(spring.target)!;
+      const delta = safeDelta(source, target, `unified:${spring.source}:${spring.target}`);
+      const pull = (delta.distance - spring.rest) * spring.strength;
+      if (spring.source !== fixedKey) { forces.get(spring.source)!.x += delta.x * pull; forces.get(spring.source)!.y += delta.y * pull; }
+      if (spring.target !== fixedKey) { forces.get(spring.target)!.x -= delta.x * pull; forces.get(spring.target)!.y -= delta.y * pull; }
+    }
+    for (const [key, point] of positions) {
+      if (key === fixedKey) continue;
+      const base = bases.get(key)!;
+      const force = forces.get(key)!;
+      force.x += (base.x - point.x) * 0.03;
+      force.y += (base.y - point.y) * 0.03;
+      point.x = clamp(point.x + force.x * 0.56, PADDING, WIDTH - PADDING);
+      point.y = clamp(point.y + force.y * 0.56, PADDING, HEIGHT - PADDING);
+    }
+    resolveUnifiedCollisions(positions, fixedKey);
+    positions.set(fixedKey, fixedTarget);
+  }
+  keepPeripheralNodesOutsideClusters(graph, positions, skillKey, centerKey);
+
+  return {
+    nodeOffsets: Object.fromEntries(graph.nodes.map((node) => {
+      const key = skillKey(node.skillId);
+      const base = bases.get(key)!;
+      const point = positions.get(key)!;
+      return [node.skillId, { x: point.x - base.x, y: point.y - base.y }];
+    })),
+    centerOffsets: Object.fromEntries(graph.clusters.map((cluster) => {
+      const key = centerKey(cluster.clusterId);
+      const base = bases.get(key)!;
+      const point = positions.get(key)!;
+      return [cluster.clusterId, { x: point.x - base.x, y: point.y - base.y }];
+    })),
+  };
+}
+
+function resolveUnifiedCollisions(points: Map<string, GraphPoint>, fixedKey: string) {
+  const entries = [...points.entries()];
+  for (let pass = 0; pass < 5; pass += 1) for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+    const [leftKey, left] = entries[leftIndex];
+    const [rightKey, right] = entries[rightIndex];
+    const delta = safeDelta(left, right, `unified-collision:${leftKey}:${rightKey}`);
+    const minimum = leftKey.startsWith("center:") || rightKey.startsWith("center:") ? 48 : NODE_GAP;
+    if (delta.distance >= minimum) continue;
+    const overlap = minimum - delta.distance + 0.15;
+    if (leftKey === fixedKey) { right.x += delta.x * overlap; right.y += delta.y * overlap; }
+    else if (rightKey === fixedKey) { left.x -= delta.x * overlap; left.y -= delta.y * overlap; }
+    else { left.x -= delta.x * overlap * 0.5; left.y -= delta.y * overlap * 0.5; right.x += delta.x * overlap * 0.5; right.y += delta.y * overlap * 0.5; }
+  }
+}
+
+function keepPeripheralNodesOutsideClusters(
+  graph: SkillGraphSnapshot,
+  positions: Map<string, GraphPoint>,
+  skillKey: (id: string) => string,
+  centerKey: (id: string) => string,
+) {
+  const clusteredIds = new Set(graph.clusters.flatMap((cluster) => cluster.memberSkillIds));
+  const geometries = graph.clusters.map((cluster) => ({
+    cluster,
+    geometry: calculateDynamicClusterGeometry(
+      cluster.memberSkillIds.map((id) => positions.get(skillKey(id))!).filter(Boolean),
+      positions.get(centerKey(cluster.clusterId))!,
+    ),
+  }));
+  for (const node of graph.nodes.filter((item) => !clusteredIds.has(item.skillId))) {
+    const point = positions.get(skillKey(node.skillId))!;
+    for (const { cluster, geometry } of geometries) {
+      const delta = safeDelta(geometry, point, `peripheral:${cluster.clusterId}:${node.skillId}`);
+      const minimum = geometry.radius + NODE_VISUAL_RADIUS + 6;
+      if (delta.distance < minimum) {
+        point.x = clamp(geometry.x + delta.x * minimum, PADDING, WIDTH - PADDING);
+        point.y = clamp(geometry.y + delta.y * minimum, PADDING, HEIGHT - PADDING);
+      }
+    }
+  }
 }
 
 export function propagateDragOffsets(

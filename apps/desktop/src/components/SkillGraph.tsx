@@ -19,8 +19,8 @@ import {
   getSkillGraphLayout,
   graphViewport,
   parallelEdgeOffset,
-  propagateClusterDragOffsets,
-  propagateDragOffsets,
+  calculateDynamicClusterGeometry,
+  propagateInteractiveDrag,
   type GraphPoint,
 } from "./skillGraphLayout";
 
@@ -200,9 +200,7 @@ export function SkillGraph({
   const displayPoint = (skillId: string): GraphPoint => {
     const point = layout.nodePoints.get(skillId) ?? graphViewport.center;
     const offset = dragOffsets[skillId] ?? { x: 0, y: 0 };
-    const clusterId = nodesById.get(skillId)?.clusterId;
-    const clusterOffset = clusterId ? clusterOffsets[clusterId] ?? { x: 0, y: 0 } : { x: 0, y: 0 };
-    return { x: point.x + offset.x + clusterOffset.x, y: point.y + offset.y + clusterOffset.y };
+    return { x: point.x + offset.x, y: point.y + offset.y };
   };
   const clusterPoint = (clusterId: string) => {
     const point = layout.clusterPoints.get(clusterId) ?? graphViewport.center;
@@ -305,26 +303,30 @@ export function SkillGraph({
     }
     if (!graph) return;
     if (drag.type === "cluster") {
-      const nextClusterOffsets = propagateClusterDragOffsets(
+      const next = propagateInteractiveDrag(
         graph,
         layout,
-        drag.clusterId,
-        { x: drag.origin.x + dx, y: drag.origin.y + dy },
+        { type: "cluster", id: drag.clusterId, offset: { x: drag.origin.x + dx, y: drag.origin.y + dy } },
+        dragOffsetsRef.current,
         clusterOffsetsRef.current,
       );
-      clusterOffsetsRef.current = nextClusterOffsets;
-      setClusterOffsets(nextClusterOffsets);
+      dragOffsetsRef.current = next.nodeOffsets;
+      clusterOffsetsRef.current = next.centerOffsets;
+      setDragOffsets(next.nodeOffsets);
+      setClusterOffsets(next.centerOffsets);
       return;
     }
-    const nextOffsets = propagateDragOffsets(
+    const next = propagateInteractiveDrag(
       graph,
       layout,
-      drag.nodeId,
-      { x: drag.origin.x + dx, y: drag.origin.y + dy },
+      { type: "skill", id: drag.nodeId, offset: { x: drag.origin.x + dx, y: drag.origin.y + dy } },
       dragOffsetsRef.current,
+      clusterOffsetsRef.current,
     );
-    dragOffsetsRef.current = nextOffsets;
-    setDragOffsets(nextOffsets);
+    dragOffsetsRef.current = next.nodeOffsets;
+    clusterOffsetsRef.current = next.centerOffsets;
+    setDragOffsets(next.nodeOffsets);
+    setClusterOffsets(next.centerOffsets);
   };
 
   const endDrag = () => {
@@ -395,13 +397,16 @@ export function SkillGraph({
           <g className="skill-graph__clusters">
             {(graph?.clusters ?? []).map((cluster) => {
               const point = clusterPoint(cluster.clusterId);
-              const radius = layout.clusterRadii.get(cluster.clusterId) ?? 100;
+              const geometry = calculateDynamicClusterGeometry(
+                cluster.memberSkillIds.map(displayPoint),
+                point,
+              );
               return (
                 <g
                   key={cluster.clusterId}
                   className={`skill-graph__cluster${selectedCluster && selectedCluster.clusterId !== cluster.clusterId ? " is-muted" : ""}`}
                 >
-                  <circle className="skill-graph__cluster-cloud" cx={point.x} cy={point.y} r={radius} />
+                  <circle className="skill-graph__cluster-cloud" cx={geometry.x} cy={geometry.y} r={geometry.radius} />
                   {cluster.coreSkillIds.map((skillId) => {
                     const target = displayPoint(skillId);
                     return <line key={skillId} className="skill-graph__core-link" x1={point.x} y1={point.y} x2={target.x} y2={target.y} />;
