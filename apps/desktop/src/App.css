@@ -2153,6 +2153,39 @@ a:focus-visible {
   grid-column: 1 / -1;
 }
 
+.job-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.job-heading-actions > span {
+  color: var(--color-text-faint);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 0.55rem;
+}
+
+.job-heading-actions button,
+.job-list .job-delete-button {
+  min-height: 2rem;
+  padding: 0 0.65rem;
+  border-color: rgba(255, 103, 103, 0.38);
+  color: #e7a0a0;
+}
+
+.job-heading-actions button:hover:not(:disabled),
+.job-list .job-delete-button:hover:not(:disabled) {
+  border-color: rgba(255, 103, 103, 0.68);
+  color: #ffd0d0;
+  background: rgba(255, 86, 86, 0.08);
+}
+
+.job-heading-actions button:disabled,
+.job-list .job-delete-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .adaptive-metrics {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }

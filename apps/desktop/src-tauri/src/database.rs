@@ -1913,6 +1913,22 @@ impl Database {
         Ok(jobs)
     }
 
+    pub fn delete_job_history(&self, job_id: Option<&str>) -> DatabaseResult<u64> {
+        let connection = self.connection()?;
+        let deleted = if let Some(job_id) = job_id {
+            connection.execute(
+                "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status IN ('completed', 'failed', 'cancelled')",
+                [job_id],
+            )?
+        } else {
+            connection.execute(
+                "DELETE FROM embedding_jobs WHERE status IN ('completed', 'failed', 'cancelled')",
+                [],
+            )?
+        };
+        Ok(deleted as u64)
+    }
+
     pub fn update_job(
         &self,
         job_id: &str,
@@ -3494,6 +3510,7 @@ mod tests {
             error: None,
         };
         database.create_job(&job).unwrap();
+        assert_eq!(database.delete_job_history(Some("job-cancel")).unwrap(), 0);
         assert!(database.request_job_cancel("job-cancel").unwrap());
         assert!(database.is_job_cancel_requested("job-cancel").unwrap());
         database
@@ -3503,6 +3520,25 @@ mod tests {
             database.list_jobs().unwrap()[0].status,
             JobStatus::Cancelled
         );
+        assert_eq!(database.delete_job_history(Some("job-cancel")).unwrap(), 1);
+        assert!(database.list_jobs().unwrap().is_empty());
+
+        let mut active_job = job.clone();
+        active_job.job_id = "job-active".to_string();
+        active_job.status = JobStatus::Running;
+        let mut completed_job = job.clone();
+        completed_job.job_id = "job-completed".to_string();
+        completed_job.status = JobStatus::Completed;
+        let mut failed_job = job.clone();
+        failed_job.job_id = "job-failed".to_string();
+        failed_job.status = JobStatus::Failed;
+        database.create_job(&active_job).unwrap();
+        database.create_job(&completed_job).unwrap();
+        database.create_job(&failed_job).unwrap();
+        assert_eq!(database.delete_job_history(None).unwrap(), 2);
+        let remaining_jobs = database.list_jobs().unwrap();
+        assert_eq!(remaining_jobs.len(), 1);
+        assert_eq!(remaining_jobs[0].job_id, "job-active");
 
         let vector = StoredVector {
             embedding_id: "embedding-ready".to_string(),

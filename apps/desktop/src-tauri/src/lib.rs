@@ -1270,6 +1270,24 @@ fn list_embedding_jobs(database: State<'_, Database>) -> Result<Vec<EmbeddingJob
         .map_err(|error| format!("无法读取 Embedding Jobs：{error}"))
 }
 
+#[tauri::command]
+fn delete_embedding_job_history(
+    database: State<'_, Database>,
+    job_id: String,
+) -> Result<bool, String> {
+    database
+        .delete_job_history(Some(&job_id))
+        .map(|deleted| deleted > 0)
+        .map_err(|error| format!("无法删除 Embedding Job 历史：{error}"))
+}
+
+#[tauri::command]
+fn clear_embedding_job_history(database: State<'_, Database>) -> Result<u64, String> {
+    database
+        .delete_job_history(None)
+        .map_err(|error| format!("无法清空 Embedding Jobs 历史：{error}"))
+}
+
 struct StagedJobTarget {
     profile: EmbeddingProfile,
     source_profile_id: Option<String>,
@@ -3633,6 +3651,8 @@ pub fn run() {
             scan_embedding_changes,
             get_index_diff,
             list_embedding_jobs,
+            delete_embedding_job_history,
+            clear_embedding_job_history,
             start_embedding_job,
             cancel_embedding_job,
             semantic_search,

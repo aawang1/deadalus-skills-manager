@@ -103,6 +103,10 @@ export const api = {
   beginFullRebuildPreflight: (profileId?: string) =>
     invoke<PreflightEstimate>("begin_full_rebuild_preflight", { profileId }),
   listEmbeddingJobs: () => invoke<EmbeddingJob[]>("list_embedding_jobs"),
+  deleteEmbeddingJobHistory: (jobId: string) =>
+    invoke<boolean>("delete_embedding_job_history", { jobId }),
+  clearEmbeddingJobHistory: () =>
+    invoke<number>("clear_embedding_job_history"),
   startEmbeddingJob: (
     strategy: "incremental" | "full_rebuild" | "profile_migration",
     request?: ProfileChangeRequest,

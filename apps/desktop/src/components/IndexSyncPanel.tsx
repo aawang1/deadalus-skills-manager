@@ -155,6 +155,44 @@ export function IndexSyncPanel({
     }
   };
 
+  const deleteJobHistory = async (job: EmbeddingJob) => {
+    if (!window.confirm(`确定删除这条 ${job.kind} / ${job.status} Job 历史吗？此操作无法撤销。`)) {
+      return;
+    }
+    setBusy(`delete:${job.jobId}`);
+    try {
+      const deleted = await api.deleteEmbeddingJobHistory(job.jobId);
+      if (!deleted) {
+        notify("info", "该 Job 仍在活动中，未删除。");
+        return;
+      }
+      setJobs((current) => current.filter((item) => item.jobId !== job.jobId));
+      notify("success", "Job 历史已删除。");
+    } catch (error) {
+      unavailable(error);
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  const clearJobHistory = async () => {
+    const finishedCount = jobs.filter((job) => isFinishedJob(job.status)).length;
+    if (finishedCount === 0) return;
+    if (!window.confirm(`确定清空 ${finishedCount} 条已结束的 Jobs 历史吗？活动任务会保留，此操作无法撤销。`)) {
+      return;
+    }
+    setBusy("clear-jobs");
+    try {
+      const deleted = await api.clearEmbeddingJobHistory();
+      setJobs(await api.listEmbeddingJobs());
+      notify("success", `已删除 ${deleted} 条 Jobs 历史。`);
+    } catch (error) {
+      unavailable(error);
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
   const disabled = !isNative || !workerAvailable;
 
   return (
@@ -257,7 +295,7 @@ export function IndexSyncPanel({
           </dl>
         </section>
         <section className="panel-section">
-          <header className="section-heading"><div><h3>Jobs</h3><p>最近向量任务</p></div><span>{jobs.length}</span></header>
+          <header className="section-heading"><div><h3>Jobs</h3><p>最近向量任务</p></div><div className="job-heading-actions"><span>{jobs.length}</span><button className="danger-outline" type="button" disabled={disabled || busy != null || !jobs.some((job) => isFinishedJob(job.status))} onClick={clearJobHistory}>{busy === "clear-jobs" ? "清理中…" : "清空历史"}</button></div></header>
           <div className="job-list">
             {jobs.length === 0 ? <div className="empty-card">暂无任务</div> : jobs.map((job) => (
               <div key={job.jobId}>
@@ -269,6 +307,17 @@ export function IndexSyncPanel({
                     取消
                   </button>
                 )}
+                {isFinishedJob(job.status) && (
+                  <button
+                    className="job-delete-button"
+                    type="button"
+                    disabled={disabled || busy != null}
+                    aria-label={`删除 ${job.kind} Job 历史`}
+                    onClick={() => deleteJobHistory(job)}
+                  >
+                    {busy === `delete:${job.jobId}` ? "删除中…" : "删除历史"}
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -276,4 +325,8 @@ export function IndexSyncPanel({
       </div>
     </div>
   );
+}
+
+function isFinishedJob(status: EmbeddingJob["status"]) {
+  return ["completed", "failed", "cancelled"].includes(status);
 }
