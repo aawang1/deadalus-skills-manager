@@ -1221,12 +1221,30 @@ fn scan_embedding_changes(
     app: AppHandle,
     database: State<'_, Database>,
 ) -> Result<IndexDiff, String> {
-    let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = build_canonical_snapshot(&app)?;
+    database
+        .replace_canonical_snapshot(&snapshot)
+        .map_err(|error| format!("无法保存变更扫描快照：{error}"))?;
     let (_, diff) = diff_for_active_profile(database.inner(), &snapshot)?;
     database
         .save_index_diff(&diff)
         .map_err(|error| format!("无法保存索引差异：{error}"))?;
     Ok(diff)
+}
+
+fn incremental_work_snapshot(
+    database: &Database,
+    profile_id: &str,
+    snapshot: &CanonicalSnapshot,
+) -> Result<CanonicalSnapshot, String> {
+    let unchanged = database
+        .unchanged_indexed_skill_ids(profile_id, snapshot)
+        .map_err(|error| format!("无法读取已复用 Skills：{error}"))?;
+    let mut work = snapshot.clone();
+    work.skills.retain(|skill| {
+        !skill.path.starts_with("bundled://") && !unchanged.contains(&skill.skill_id)
+    });
+    Ok(work)
 }
 
 #[tauri::command]
@@ -1563,7 +1581,12 @@ fn start_embedding_job(
     }
     let profile = staged.profile;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
-    let estimate = estimate_preflight(&snapshot, &profile);
+    let estimate_snapshot = if strategy == JobStrategy::Incremental {
+        incremental_work_snapshot(database.inner(), &profile.profile_id, &snapshot)?
+    } else {
+        snapshot.clone()
+    };
+    let estimate = estimate_preflight(&estimate_snapshot, &profile);
     let job = EmbeddingJob {
         job_id: Uuid::new_v4().to_string(),
         profile_id: profile.profile_id.clone(),
@@ -2367,11 +2390,21 @@ async fn run_embedding_job_inner(
         .current_canonical_snapshot()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "规范快照不存在".to_string())?;
+    let work_snapshot = if job.kind == vectorization::JobKind::Incremental {
+        incremental_work_snapshot(database, &profile.profile_id, &snapshot)?
+    } else {
+        snapshot.clone()
+    };
     let provider = RemoteEmbeddingProvider::new(&profile, api_key, ReqwestJsonTransport);
     let analysis_provider = active_analysis_provider(app)?;
     let mut completed = 0u64;
     let mut actual_tokens = 0u64;
-    let mut current_skill_ids = Vec::new();
+    let current_skill_ids = snapshot
+        .skills
+        .iter()
+        .filter(|skill| !skill.path.starts_with("bundled://"))
+        .map(|skill| skill.skill_id.clone())
+        .collect::<Vec<_>>();
     let input_config = InputGenerationConfig {
         max_parent_tokens: usize::try_from(context.adaptive_policy.u)
             .unwrap_or(usize::MAX)
@@ -2382,7 +2415,7 @@ async fn run_embedding_job_inner(
         ..Default::default()
     };
 
-    for skill in snapshot
+    for skill in work_snapshot
         .skills
         .iter()
         .filter(|skill| !skill.path.starts_with("bundled://"))
@@ -2409,7 +2442,6 @@ async fn run_embedding_job_inner(
             emit_toast(app, "info", "Embedding Job 已取消");
             return Ok(());
         }
-        current_skill_ids.push(skill.skill_id.clone());
         let prepared = prepare_skill_inputs(skill, &input_config)?;
         database
             .save_generated_inputs(
@@ -2421,7 +2453,17 @@ async fn run_embedding_job_inner(
             .map_err(|error| error.to_string())?;
 
         let rule = rule_result(&skill.skill_id, &prepared.inputs);
-        if let Some(analysis_provider) = &analysis_provider {
+        let analysis_cached = database
+            .has_analysis_for_input(
+                &skill.skill_id,
+                &rule.input_hash,
+                analysis_provider.is_some(),
+            )
+            .map_err(|error| error.to_string())?;
+        if analysis_cached {
+            // Deterministic inputs and the requested analysis tier are already
+            // available. Reuse them without another remote LLM call.
+        } else if let Some(analysis_provider) = &analysis_provider {
             let markdown = prepared
                 .inputs
                 .iter()
@@ -3765,6 +3807,43 @@ mod tests {
             activated_at: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn incremental_work_snapshot_keeps_only_added_or_changed_skills() {
+        let database = Database::in_memory().unwrap();
+        let profile = test_embedding_profile(
+            "profile-incremental",
+            "openai",
+            "text-embedding-3-small",
+            "1",
+            1536,
+            "credential-openai",
+        );
+        database.upsert_profile(&profile).unwrap();
+        let snapshot = test_canonical_snapshot();
+        database
+            .replace_indexed_skills(&profile.profile_id, &snapshot, 1)
+            .unwrap();
+
+        let unchanged = incremental_work_snapshot(&database, &profile.profile_id, &snapshot)
+            .expect("unchanged snapshot should be reusable");
+        assert!(unchanged.skills.is_empty());
+
+        let mut updated = snapshot.clone();
+        updated.skills[0].content_hash = "changed-content".to_string();
+        updated
+            .skills
+            .push(test_canonical_skill("skill-new", "new", &["codex"]));
+        let work = incremental_work_snapshot(&database, &profile.profile_id, &updated)
+            .expect("changed snapshot should produce incremental work");
+        assert_eq!(
+            work.skills
+                .iter()
+                .map(|skill| skill.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill-codex", "skill-new"]
+        );
     }
 
     #[test]

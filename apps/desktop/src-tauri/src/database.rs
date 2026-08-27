@@ -1669,6 +1669,40 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn has_analysis_for_input(
+        &self,
+        skill_id: &str,
+        input_hash: &str,
+        require_llm: bool,
+    ) -> DatabaseResult<bool> {
+        let connection = self.connection()?;
+        let rule_exists: bool = connection.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM analysis_rule_results
+                WHERE skill_id = ?1 AND input_hash = ?2
+            )
+            "#,
+            params![skill_id, input_hash],
+            |row| row.get(0),
+        )?;
+        if !rule_exists || !require_llm {
+            return Ok(rule_exists);
+        }
+        connection
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM analysis_llm_results
+                    WHERE skill_id = ?1 AND input_hash = ?2
+                )
+                "#,
+                params![skill_id, input_hash],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn expire_skill_vectors(
         &self,
         profile_id: &str,
@@ -2050,6 +2084,32 @@ impl Database {
             removed,
             unchanged,
         })
+    }
+
+    pub fn unchanged_indexed_skill_ids(
+        &self,
+        profile_id: &str,
+        snapshot: &CanonicalSnapshot,
+    ) -> DatabaseResult<std::collections::HashSet<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT skill_id, content_hash FROM indexed_skills WHERE profile_id = ?1")?;
+        let indexed = statement
+            .query_map([profile_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(snapshot
+            .skills
+            .iter()
+            .filter(|skill| !skill.path.starts_with("bundled://"))
+            .filter(|skill| {
+                indexed
+                    .get(&skill.skill_id)
+                    .is_some_and(|hash| hash == &skill.content_hash)
+            })
+            .map(|skill| skill.skill_id.clone())
+            .collect())
     }
 
     pub fn replace_indexed_skills(
@@ -3479,6 +3539,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             database
+                .unchanged_indexed_skill_ids("profile-index", &snapshot)
+                .unwrap(),
+            std::collections::HashSet::from(["skill-stable".to_string()])
+        );
+        assert_eq!(
+            database
                 .compute_index_diff("profile-index", &snapshot)
                 .unwrap()
                 .unchanged,
@@ -3486,6 +3552,10 @@ mod tests {
         );
         let mut changed = snapshot.clone();
         changed.skills[0].content_hash = "changed".to_string();
+        assert!(database
+            .unchanged_indexed_skill_ids("profile-index", &changed)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             database
                 .compute_index_diff("profile-index", &changed)
@@ -3563,6 +3633,65 @@ mod tests {
             database.load_vectors("profile-index").unwrap()[0].status,
             VectorStatus::Expired
         );
+        database
+            .remove_deleted_profile_skills("profile-index", &[])
+            .unwrap();
+        assert!(database.load_vectors("profile-index").unwrap().is_empty());
+        assert_eq!(
+            database
+                .compute_index_diff("profile-index", &snapshot)
+                .unwrap()
+                .added,
+            1
+        );
+    }
+
+    #[test]
+    fn analysis_cache_distinguishes_rule_only_from_llm_complete() {
+        let database = Database::in_memory().unwrap();
+        database
+            .connection()
+            .unwrap()
+            .execute(
+                r#"
+                INSERT INTO analysis_rule_results (
+                    result_id, skill_id, parser_version, input_hash, result_json, created_at
+                ) VALUES ('rule-1', 'skill-1', '1', 'input-1', '{}', 1)
+                "#,
+                [],
+            )
+            .unwrap();
+
+        assert!(database
+            .has_analysis_for_input("skill-1", "input-1", false)
+            .unwrap());
+        assert!(!database
+            .has_analysis_for_input("skill-1", "input-1", true)
+            .unwrap());
+        assert!(!database
+            .has_analysis_for_input("skill-1", "input-changed", false)
+            .unwrap());
+
+        database
+            .connection()
+            .unwrap()
+            .execute(
+                r#"
+                INSERT INTO analysis_llm_results (
+                    result_id, skill_id, provider, model, prompt_version,
+                    prompt_text, schema_version, input_hash, raw_output_json,
+                    result_json, created_at
+                ) VALUES (
+                    'llm-1', 'skill-1', 'test', 'analysis', '1',
+                    'prompt', '1', 'input-1', '{}', '{}', 2
+                )
+                "#,
+                [],
+            )
+            .unwrap();
+        assert!(database
+            .has_analysis_for_input("skill-1", "input-1", true)
+            .unwrap());
     }
 
     #[test]
