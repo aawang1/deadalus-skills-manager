@@ -1593,6 +1593,27 @@ impl Database {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         for input in inputs {
+            // Stable Skill identity migrations can leave an otherwise identical
+            // input under its legacy input_id. Replace only that stale identity
+            // before inserting the deterministic current input_id. Its chunks are
+            // removed by the foreign-key cascade and rebuilt below.
+            transaction.execute(
+                r#"
+                DELETE FROM embedding_inputs
+                WHERE skill_id = ?1
+                  AND vector_type = ?2
+                  AND resource_category IS ?3
+                  AND input_hash = ?4
+                  AND input_id <> ?5
+                "#,
+                params![
+                    skill_id,
+                    input.parent.vector_type.as_str(),
+                    input.parent.resource_category,
+                    input.input_hash,
+                    input.input_id,
+                ],
+            )?;
             transaction.execute(
                 r#"
                 INSERT INTO embedding_inputs (
@@ -3258,10 +3279,11 @@ fn table_count(connection: &Connection, table: &str) -> DatabaseResult<u64> {
 mod tests {
     use super::*;
     use crate::vectorization::{
-        JobKind, JobStatus, ProfileStatus, VectorLevel, VectorStatus, CHUNK_POLICY_VERSION,
-        INPUT_SCHEMA_VERSION,
+        GeneratedChunk, GeneratedInput, JobKind, JobStatus, ProfileStatus, StructuredParentInput,
+        VectorLevel, VectorStatus, CHUNK_POLICY_VERSION, INPUT_SCHEMA_VERSION,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn profile(id: &str, status: ProfileStatus) -> EmbeddingProfile {
         EmbeddingProfile {
@@ -3761,6 +3783,77 @@ mod tests {
                 .unchanged,
             1
         );
+    }
+
+    #[test]
+    fn generated_inputs_replace_legacy_input_identity_after_skill_rebind() {
+        let database = Database::in_memory().unwrap();
+        let parent = StructuredParentInput {
+            vector_type: VectorType::OverallFunction,
+            resource_category: None,
+            title: "Stable Skill".to_string(),
+            fields: BTreeMap::new(),
+            source_headings: vec!["Description".to_string()],
+            schema_version: INPUT_SCHEMA_VERSION.to_string(),
+        };
+        let generated = |input_id: &str, chunk_id: &str| GeneratedInput {
+            input_id: input_id.to_string(),
+            parent: parent.clone(),
+            text: "same deterministic input".to_string(),
+            input_hash: "same-input-hash".to_string(),
+            chunks: vec![GeneratedChunk {
+                chunk_id: chunk_id.to_string(),
+                vector_type: VectorType::OverallFunction,
+                resource_category: None,
+                relative_file_path: "SKILL.md".to_string(),
+                heading_path: "Description".to_string(),
+                semantic_role: "description".to_string(),
+                local_anchor: "description".to_string(),
+                text: "same deterministic input".to_string(),
+                token_estimate: 3,
+                input_hash: "same-chunk-hash".to_string(),
+                content_hash: "same-content-hash".to_string(),
+            }],
+        };
+
+        database
+            .save_generated_inputs(
+                "snapshot-old",
+                "skill-old",
+                &[generated("legacy-input-id", "legacy-chunk-id")],
+                1,
+            )
+            .unwrap();
+        database
+            .rebind_skill_identity("skill-old", "skill-stable")
+            .unwrap();
+
+        database
+            .save_generated_inputs(
+                "snapshot-current",
+                "skill-stable",
+                &[generated("stable-input-id", "stable-chunk-id")],
+                2,
+            )
+            .unwrap();
+
+        let connection = database.connection().unwrap();
+        let input_ids = connection
+            .prepare("SELECT input_id FROM embedding_inputs ORDER BY input_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let chunk_ids = connection
+            .prepare("SELECT chunk_id FROM embedding_chunks ORDER BY chunk_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(input_ids, vec!["stable-input-id"]);
+        assert_eq!(chunk_ids, vec!["stable-chunk-id"]);
     }
 
     #[test]
