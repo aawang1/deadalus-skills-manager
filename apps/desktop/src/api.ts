@@ -57,6 +57,8 @@ export const api = {
     }),
   listEmbeddingProfiles: () =>
     invoke<EmbeddingProfile[]>("list_embedding_profiles"),
+  deleteEmbeddingProfile: (profileId: string) =>
+    invoke<boolean>("delete_embedding_profile", { profileId }),
   createEmbeddingProfile: (request: CreateEmbeddingProfileRequest) =>
     invoke<EmbeddingProfile>("create_embedding_profile", { request }),
   getActiveEmbeddingProfile: () =>
@@ -97,6 +99,8 @@ export const api = {
     invoke<IndexSyncStatus>("get_index_sync_status"),
   setIndexAutoUpdate: (enabled: boolean) =>
     invoke<IndexSyncStatus>("set_index_auto_update", { enabled }),
+  setIgnoreBuiltInSkills: (enabled: boolean) =>
+    invoke<IndexSyncStatus>("set_ignore_built_in_skills", { enabled }),
   scanEmbeddingChanges: () =>
     invoke<IndexDiff>("scan_embedding_changes"),
   getIndexDiff: () => invoke<IndexDiff>("get_index_diff"),

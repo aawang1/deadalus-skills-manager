@@ -177,6 +177,7 @@ export interface EmbeddingJob {
 
 export interface IndexSyncStatus {
   autoUpdate: boolean;
+  ignoreBuiltInSkills: boolean;
   indexedSkills: number;
   pendingChanges: number;
   lastSyncedAt?: number;

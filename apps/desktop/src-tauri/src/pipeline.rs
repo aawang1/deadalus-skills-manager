@@ -951,6 +951,7 @@ pub struct IndexDiff {
 #[serde(rename_all = "camelCase")]
 pub struct IndexSyncStatus {
     pub auto_update: bool,
+    pub ignore_built_in_skills: bool,
     pub indexed_skills: u64,
     pub pending_changes: u64,
     pub last_synced_at: Option<i64>,

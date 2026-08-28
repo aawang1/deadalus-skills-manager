@@ -59,6 +59,8 @@ function App() {
   );
   const keyInputRef = useRef<HTMLInputElement>(null);
   const dButtonRef = useRef<HTMLButtonElement>(null);
+  const skillRefreshInFlight = useRef(false);
+  const suppressSkillEventsUntil = useRef(0);
 
   const b2Width = Math.round(window.screen.width * 0.15);
   const shellStyle = {
@@ -102,7 +104,9 @@ function App() {
     let isCurrent = true;
     setSkillState("loading");
     setSkillError("");
-    loadSkills(libraryVersion > 0)
+    const refreshing = libraryVersion > 0;
+    if (refreshing) skillRefreshInFlight.current = true;
+    loadSkills(refreshing)
       .then((result) => {
         if (!isCurrent) return;
         setSkillResult(result);
@@ -112,6 +116,13 @@ function App() {
         if (!isCurrent) return;
         setSkillError(String(error));
         setSkillState("error");
+      })
+      .finally(() => {
+        if (!refreshing) return;
+        suppressSkillEventsUntil.current = Date.now() + 3000;
+        window.setTimeout(() => {
+          skillRefreshInFlight.current = false;
+        }, 3000);
       });
 
     return () => {
@@ -125,8 +136,15 @@ function App() {
     let stopListening: (() => void) | undefined;
     let refreshTimer: number | undefined;
     listen("all-skills-changed", () => {
+      if (
+        skillRefreshInFlight.current ||
+        Date.now() < suppressSkillEventsUntil.current
+      ) {
+        return;
+      }
       window.clearTimeout(refreshTimer);
       refreshTimer = window.setTimeout(() => {
+        skillRefreshInFlight.current = true;
         setLibraryVersion((version) => version + 1);
       }, 1000);
     }).then((unlisten) => {

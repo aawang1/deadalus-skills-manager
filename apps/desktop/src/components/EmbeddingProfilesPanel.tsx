@@ -129,6 +129,25 @@ export function EmbeddingProfilesPanel({
     }
   };
 
+  const deleteProfile = async (profile: EmbeddingProfile) => {
+    if (!isNative || profile.isActive) return;
+    if (!window.confirm(`确定删除 Profile ${profile.model}？其索引、向量、Jobs 与本地验证数据将一并删除。`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const deleted = await api.deleteEmbeddingProfile(profile.profileId);
+      if (deleted) {
+        setProfiles(profiles.filter((item) => item.profileId !== profile.profileId));
+        notify("success", "Embedding Profile 已删除。");
+      }
+    } catch (error) {
+      notify("error", String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="settings-panel profiles-panel">
       <section className="panel-section profile-create">
@@ -221,6 +240,16 @@ export function EmbeddingProfilesPanel({
                   <span className={`status-badge status-badge--${profile.status}`}>
                     {profile.status.toUpperCase()}
                   </span>
+                  <button
+                    className="profile-delete-button"
+                    type="button"
+                    aria-label={`删除 ${profile.model} Profile`}
+                    title={profile.isActive ? "活动 Profile 不能删除" : "删除 Profile"}
+                    disabled={!isNative || busy || profile.isActive}
+                    onClick={() => deleteProfile(profile)}
+                  >
+                    ×
+                  </button>
                 </div>
               </header>
               <dl>

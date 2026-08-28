@@ -1920,7 +1920,32 @@ a:focus-visible {
 
 .profile-badges {
   display: flex;
+  align-items: center;
   gap: 0.3rem;
+}
+
+.profile-delete-button {
+  width: 1.35rem;
+  height: 1.35rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  color: var(--color-text-faint);
+  background: transparent;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.profile-delete-button:hover:not(:disabled),
+.profile-delete-button:focus-visible {
+  border-color: rgba(255, 94, 94, 0.38);
+  color: #ff8e8e;
+  background: rgba(255, 94, 94, 0.08);
+}
+
+.profile-delete-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
 }
 
 .profile-card dl {
@@ -2090,7 +2115,36 @@ a:focus-visible {
 
 .sync-buttons {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.compact-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  margin-right: 0.2rem;
+  color: var(--color-text-muted);
+  font-size: 0.58rem;
+  white-space: nowrap;
+}
+
+.sync-buttons .toggle--compact {
+  min-height: 1.1rem;
+  width: 1.9rem;
+  height: 1.1rem;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.sync-buttons .toggle--compact span {
+  width: 0.72rem;
+  height: 0.72rem;
+}
+
+.sync-buttons .toggle--compact.is-on span {
+  transform: translateX(0.78rem);
 }
 
 .danger-outline {

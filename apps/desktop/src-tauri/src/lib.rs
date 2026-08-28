@@ -675,6 +675,23 @@ fn list_embedding_profiles(database: State<'_, Database>) -> Result<Vec<Embeddin
 }
 
 #[tauri::command]
+fn delete_embedding_profile(
+    database: State<'_, Database>,
+    profile_id: String,
+) -> Result<bool, String> {
+    database.delete_profile(&profile_id).map_err(|error| {
+        let detail = error.to_string();
+        if detail.contains("delete_active") {
+            "不能删除当前活动 Profile；请先激活其他 Ready Profile。".to_string()
+        } else if detail.contains("delete_with_active_jobs") {
+            "该 Profile 仍有进行中的 Job；请先取消或等待任务结束。".to_string()
+        } else {
+            format!("无法删除 Embedding Profile：{error}")
+        }
+    })
+}
+
+#[tauri::command]
 fn create_embedding_profile(
     app: AppHandle,
     database: State<'_, Database>,
@@ -1124,6 +1141,7 @@ fn prepare_profile_change(
 ) -> Result<PreparedProfileChange, String> {
     let profile = preflight_profile_for_request(database.inner(), &request)?;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let estimate = estimate_preflight(&snapshot, &profile);
     let source = request
         .source_profile_id
@@ -1157,6 +1175,7 @@ fn profile_change_preflight(
 ) -> Result<vectorization::PreflightEstimate, String> {
     let profile = preflight_profile_for_request(database, request)?;
     let snapshot = current_snapshot_for_contract(app, database)?;
+    let snapshot = snapshot_for_embedding(database, &snapshot)?;
     let estimate = estimate_preflight(&snapshot, &profile);
     emit_preflight(app, &estimate);
     Ok(estimate)
@@ -1198,6 +1217,7 @@ fn begin_full_rebuild_preflight(
             .ok_or_else(|| "当前没有活动 Embedding Profile".to_string())?
     };
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let estimate = estimate_preflight(&snapshot, &profile);
     emit_preflight(&app, &estimate);
     Ok(estimate)
@@ -1229,6 +1249,20 @@ fn diff_for_active_profile(
     Ok((active, diff))
 }
 
+fn snapshot_for_embedding(
+    database: &Database,
+    snapshot: &CanonicalSnapshot,
+) -> Result<CanonicalSnapshot, String> {
+    let mut filtered = snapshot.clone();
+    if database
+        .ignore_built_in_skills()
+        .map_err(|error| format!("无法读取内置 Skills 设置：{error}"))?
+    {
+        filtered.skills.retain(|skill| !skill.is_built_in);
+    }
+    Ok(filtered)
+}
+
 #[tauri::command]
 fn scan_embedding_changes(
     app: AppHandle,
@@ -1238,7 +1272,8 @@ fn scan_embedding_changes(
     database
         .replace_canonical_snapshot(&snapshot)
         .map_err(|error| format!("无法保存变更扫描快照：{error}"))?;
-    let (_, diff) = diff_for_active_profile(database.inner(), &snapshot)?;
+    let embedding_snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
+    let (_, diff) = diff_for_active_profile(database.inner(), &embedding_snapshot)?;
     database
         .save_index_diff(&diff)
         .map_err(|error| format!("无法保存索引差异：{error}"))?;
@@ -1273,6 +1308,7 @@ fn get_index_sync_status(
     database: State<'_, Database>,
 ) -> Result<IndexSyncStatus, String> {
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let (active, diff) = diff_for_active_profile(database.inner(), &snapshot)?;
     database
         .index_sync_status(
@@ -1291,6 +1327,18 @@ fn set_index_auto_update(
     database
         .set_index_auto_update(enabled)
         .map_err(|error| format!("无法保存自动更新设置：{error}"))?;
+    get_index_sync_status(app, database)
+}
+
+#[tauri::command]
+fn set_ignore_built_in_skills(
+    app: AppHandle,
+    database: State<'_, Database>,
+    enabled: bool,
+) -> Result<IndexSyncStatus, String> {
+    database
+        .set_ignore_built_in_skills(enabled)
+        .map_err(|error| format!("无法保存内置 Skills 设置：{error}"))?;
     get_index_sync_status(app, database)
 }
 
@@ -1594,6 +1642,7 @@ fn start_embedding_job(
     }
     let profile = staged.profile;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let estimate_snapshot = if strategy == JobStrategy::Incremental {
         incremental_work_snapshot(database.inner(), &profile.profile_id, &snapshot)?
     } else {
@@ -1693,15 +1742,22 @@ async fn semantic_search(
     let snapshot = database
         .current_canonical_snapshot()
         .map_err(|error| format!("无法读取规范快照：{error}"))?;
-    let allowed = agent_filter.map(|agent| {
-        snapshot
-            .as_ref()
-            .into_iter()
-            .flat_map(|snapshot| &snapshot.skills)
-            .filter(|skill| skill.enabled_agents.iter().any(|enabled| enabled == &agent))
-            .map(|skill| skill.skill_id.clone())
-            .collect::<HashSet<_>>()
-    });
+    let allowed = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot_for_embedding(database.inner(), snapshot))
+        .transpose()?
+        .map(|snapshot| {
+            snapshot
+                .skills
+                .into_iter()
+                .filter(|skill| {
+                    agent_filter.as_ref().is_none_or(|agent| {
+                        skill.enabled_agents.iter().any(|enabled| enabled == agent)
+                    })
+                })
+                .map(|skill| skill.skill_id)
+                .collect::<HashSet<_>>()
+        });
     let vectors = database
         .load_vectors(&profile.profile_id)
         .map_err(|error| format!("无法读取活动 Profile 向量：{error}"))?;
@@ -1752,6 +1808,7 @@ fn get_skill_graph(
         graph.layout_version = graph.graph_version.clone();
         return Ok(graph);
     };
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let vectors = database
         .load_vectors(&profile.profile_id)
         .map_err(|error| format!("无法读取活动 Profile 向量：{error}"))?;
@@ -2403,6 +2460,7 @@ async fn run_embedding_job_inner(
         .current_canonical_snapshot()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "规范快照不存在".to_string())?;
+    let snapshot = snapshot_for_embedding(database, &snapshot)?;
     let work_snapshot = if job.kind == vectorization::JobKind::Incremental {
         incremental_work_snapshot(database, &profile.profile_id, &snapshot)?
     } else {
@@ -3028,6 +3086,9 @@ fn add_official_bundled_skills(agent: &str, skills: &mut Vec<InstalledSkill>) {
                 ("debug", "通过调试流程调查并解决问题"),
                 ("loop", "按指定节奏重复执行任务"),
                 ("claude-api", "协助构建 Claude API 集成"),
+                ("run", "启动并操作应用以检查实际运行结果"),
+                ("verify", "构建并运行应用以验证代码改动"),
+                ("run-skill-generator", "生成可复用的应用运行与验证流程"),
             ] {
                 add_bundled_skill(skills, agent, name, description);
             }
@@ -3035,7 +3096,33 @@ fn add_official_bundled_skills(agent: &str, skills: &mut Vec<InstalledSkill>) {
         "codex" => {
             for (name, description) in [
                 ("skill-creator", "创建或更新 Agent Skill"),
+                ("skill-installer", "安装官方精选或仓库中的 Agent Skill"),
                 ("plan", "为开发任务生成和维护实施计划"),
+            ] {
+                add_bundled_skill(skills, agent, name, description);
+            }
+        }
+        "cursor" => {
+            for (name, description) in [
+                ("automate", "创建由计划或外部事件触发的自动化"),
+                ("babysit", "持续监控并维护 Pull Request"),
+                ("canvas", "创建交互式 React 画布"),
+                ("create-hook", "创建 Cursor 生命周期 Hook"),
+                ("create-rule", "创建具有适当范围的 Cursor Rule"),
+                ("create-skill", "创建 Agent Skill"),
+                ("create-subagent", "创建专用 Subagent"),
+                ("cursor-blame", "调查 AI 生成改动及来源提示"),
+                ("loop", "按指定间隔重复执行 Prompt 或 Skill"),
+                ("migrate-to-skills", "将规则和命令迁移为 Skills"),
+                ("review", "选择并运行代码审查 Agent"),
+                ("review-bugbot", "使用 Bugbot 检查缺陷与回归"),
+                ("review-security", "执行安全漏洞审查"),
+                ("sdk", "协助构建 Cursor SDK 集成"),
+                ("shell", "将文本作为 Shell 命令执行"),
+                ("split-to-prs", "将大型变更拆分为较小 PR"),
+                ("statusline", "配置 Cursor CLI 状态栏"),
+                ("update-cli-config", "更新 Cursor CLI 设置"),
+                ("update-cursor-settings", "更新 Cursor 或 VS Code 设置"),
             ] {
                 add_bundled_skill(skills, agent, name, description);
             }
@@ -4033,6 +4120,7 @@ pub fn run() {
             list_provider_models,
             get_embedding_profile_defaults,
             list_embedding_profiles,
+            delete_embedding_profile,
             create_embedding_profile,
             get_active_embedding_profile,
             activate_ready_embedding_profile,
@@ -4049,6 +4137,7 @@ pub fn run() {
             begin_full_rebuild_preflight,
             get_index_sync_status,
             set_index_auto_update,
+            set_ignore_built_in_skills,
             scan_embedding_changes,
             get_index_diff,
             list_embedding_jobs,
@@ -4216,6 +4305,13 @@ mod tests {
         add_official_bundled_skills("codex", &mut codex);
         assert!(codex.iter().all(|skill| skill.scope == "system"));
         assert!(codex.iter().any(|skill| skill.name == "skill-creator"));
+        assert!(codex.iter().any(|skill| skill.name == "skill-installer"));
+
+        let mut cursor = Vec::new();
+        add_official_bundled_skills("cursor", &mut cursor);
+        assert_eq!(cursor.len(), 19);
+        assert!(cursor.iter().all(|skill| skill.is_built_in));
+        assert!(cursor.iter().any(|skill| skill.name == "review-security"));
     }
 
     #[test]

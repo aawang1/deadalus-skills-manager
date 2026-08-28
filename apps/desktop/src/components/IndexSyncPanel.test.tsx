@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   listEmbeddingJobs: vi.fn(),
   deleteEmbeddingJobHistory: vi.fn(),
   clearEmbeddingJobHistory: vi.fn(),
+  setIgnoreBuiltInSkills: vi.fn(),
+  scanEmbeddingChanges: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
@@ -39,7 +41,7 @@ const runningJob: EmbeddingJob = {
 
 describe("IndexSyncPanel Jobs history", () => {
   beforeEach(() => {
-    mocks.getIndexSyncStatus.mockResolvedValue({ autoUpdate: false, indexedSkills: 2, pendingChanges: 0 });
+    mocks.getIndexSyncStatus.mockResolvedValue({ autoUpdate: false, ignoreBuiltInSkills: false, indexedSkills: 2, pendingChanges: 0 });
     mocks.getIndexDiff.mockResolvedValue({ added: 0, changed: 0, removed: 0, unchanged: 2 });
     mocks.listEmbeddingJobs.mockResolvedValue([completedJob, runningJob]);
     mocks.deleteEmbeddingJobHistory.mockResolvedValue(true);

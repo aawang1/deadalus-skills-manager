@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 type RawProfile = (
     String,
@@ -397,6 +397,41 @@ impl Database {
             profiles.push(profile_from_raw(row?)?);
         }
         Ok(profiles)
+    }
+
+    pub fn delete_profile(&self, profile_id: &str) -> DatabaseResult<bool> {
+        let connection = self.connection()?;
+        let active: Option<bool> = connection
+            .query_row(
+                "SELECT is_active FROM embedding_profiles WHERE profile_id = ?1",
+                [profile_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(active) = active else {
+            return Ok(false);
+        };
+        if active {
+            return Err(DatabaseError::InvalidValue {
+                field: "embedding_profiles.delete_active",
+                value: profile_id.to_string(),
+            });
+        }
+        let active_jobs: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM embedding_jobs WHERE profile_id = ?1 AND status IN ('pending', 'running', 'paused'))",
+            [profile_id],
+            |row| row.get(0),
+        )?;
+        if active_jobs {
+            return Err(DatabaseError::InvalidValue {
+                field: "embedding_profiles.delete_with_active_jobs",
+                value: profile_id.to_string(),
+            });
+        }
+        Ok(connection.execute(
+            "DELETE FROM embedding_profiles WHERE profile_id = ?1",
+            [profile_id],
+        )? > 0)
     }
 
     pub fn activate_credential_binding(
@@ -2219,16 +2254,34 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_ignore_built_in_skills(&self, enabled: bool) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            "UPDATE index_settings SET ignore_built_in_skills = ?1 WHERE singleton_id = 1",
+            [enabled],
+        )?;
+        Ok(())
+    }
+
+    pub fn ignore_built_in_skills(&self) -> DatabaseResult<bool> {
+        self.connection()?
+            .query_row(
+                "SELECT ignore_built_in_skills FROM index_settings WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn index_sync_status(
         &self,
         active_profile_id: Option<&str>,
         pending_changes: u64,
     ) -> DatabaseResult<IndexSyncStatus> {
         let connection = self.connection()?;
-        let (auto_update, last_synced_at): (bool, Option<i64>) = connection.query_row(
-            "SELECT auto_update, last_synced_at FROM index_settings WHERE singleton_id = 1",
+        let (auto_update, ignore_built_in_skills, last_synced_at): (bool, bool, Option<i64>) = connection.query_row(
+            "SELECT auto_update, ignore_built_in_skills, last_synced_at FROM index_settings WHERE singleton_id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let indexed_skills = if let Some(profile_id) = active_profile_id {
             connection.query_row(
@@ -2241,6 +2294,7 @@ impl Database {
         };
         Ok(IndexSyncStatus {
             auto_update,
+            ignore_built_in_skills,
             indexed_skills: indexed_skills.max(0) as u64,
             pending_changes,
             last_synced_at,
@@ -2643,6 +2697,9 @@ fn migrate(connection: &mut Connection) -> DatabaseResult<()> {
     }
     if version < 4 {
         migration_v4(connection.transaction()?)?;
+    }
+    if version < 5 {
+        migration_v5(connection.transaction()?)?;
     }
     let final_version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -3115,6 +3172,18 @@ fn migration_v4(transaction: Transaction<'_>) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn migration_v5(transaction: Transaction<'_>) -> DatabaseResult<()> {
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE index_settings ADD COLUMN ignore_built_in_skills INTEGER NOT NULL DEFAULT 0
+            CHECK (ignore_built_in_skills IN (0, 1));
+        INSERT INTO schema_version(version, applied_at) VALUES (5, unixepoch());
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn profile_from_raw(raw: RawProfile) -> DatabaseResult<EmbeddingProfile> {
     Ok(EmbeddingProfile {
         profile_id: raw.0,
@@ -3437,6 +3506,35 @@ mod tests {
         assert_eq!(
             database.active_profile().unwrap().unwrap().profile_id,
             "profile-b"
+        );
+    }
+
+    #[test]
+    fn profile_deletion_rejects_active_and_removes_inactive_profile() {
+        let database = Database::in_memory().unwrap();
+        let mut active = profile("profile-active", ProfileStatus::Active);
+        active.is_active = true;
+        let inactive = profile("profile-inactive", ProfileStatus::Ready);
+        database.upsert_profile(&active).unwrap();
+        database.upsert_profile(&inactive).unwrap();
+
+        assert!(database.delete_profile(&active.profile_id).is_err());
+        assert!(database.delete_profile(&inactive.profile_id).unwrap());
+        assert!(database.profile(&inactive.profile_id).unwrap().is_none());
+        assert!(!database.delete_profile("missing").unwrap());
+    }
+
+    #[test]
+    fn ignore_built_in_skills_setting_is_persistent() {
+        let database = Database::in_memory().unwrap();
+        assert!(!database.ignore_built_in_skills().unwrap());
+        database.set_ignore_built_in_skills(true).unwrap();
+        assert!(database.ignore_built_in_skills().unwrap());
+        assert!(
+            database
+                .index_sync_status(None, 0)
+                .unwrap()
+                .ignore_built_in_skills
         );
     }
 

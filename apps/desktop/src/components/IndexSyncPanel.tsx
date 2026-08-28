@@ -155,6 +155,28 @@ export function IndexSyncPanel({
     }
   };
 
+  const toggleBuiltIns = async () => {
+    if (!status) return;
+    setBusy("built-ins");
+    try {
+      const next = await api.setIgnoreBuiltInSkills(
+        !status.ignoreBuiltInSkills,
+      );
+      setStatus(next);
+      setDiff(await api.scanEmbeddingChanges());
+      notify(
+        "success",
+        next.ignoreBuiltInSkills
+          ? "后续分析、向量化与图表将忽略内置 Skills。"
+          : "内置 Skills 已重新纳入索引范围。",
+      );
+    } catch (error) {
+      unavailable(error);
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
   const deleteJobHistory = async (job: EmbeddingJob) => {
     if (!window.confirm(`确定删除这条 ${job.kind} / ${job.status} Job 历史吗？此操作无法撤销。`)) {
       return;
@@ -253,6 +275,19 @@ export function IndexSyncPanel({
           </select>
         </label>
         <div className="sync-buttons">
+          <label className="compact-switch" title="同时影响分析、向量化、搜索和图表显示">
+            <button
+              className={`toggle toggle--compact ${status?.ignoreBuiltInSkills ? "is-on" : ""}`}
+              type="button"
+              role="switch"
+              aria-checked={status?.ignoreBuiltInSkills ?? false}
+              disabled={disabled || !status || busy != null}
+              onClick={toggleBuiltIns}
+            >
+              <span />
+            </button>
+            <span>忽略内置 Skills</span>
+          </label>
           <button
             type="button"
             disabled={disabled || busy != null}
