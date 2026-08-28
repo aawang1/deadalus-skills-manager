@@ -144,6 +144,7 @@ struct SkillFrontmatter {
 const MANAGED_SKILL_ORIGIN_FILE: &str = ".deadalus-origin.json";
 const MANAGED_SKILL_HISTORY_DIR: &str = ".history";
 const SKILL_IDENTITY_V3_MARKER: &str = "skill-identity-v3.migrated";
+const BUILT_IN_CLASSIFICATION_V2_MARKER: &str = "built-in-classification-v2.migrated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3728,6 +3729,22 @@ fn migrate_skill_identity_v3(app: &AppHandle, database: &Database) -> Result<(),
     fs::write(&marker, b"2\n").map_err(|error| format!("无法完成 Skill 身份迁移：{error}"))
 }
 
+fn migrate_built_in_classification_v2(app: &AppHandle, database: &Database) -> Result<(), String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法确定内置分类迁移目录：{error}"))?;
+    let marker = app_data.join(BUILT_IN_CLASSIFICATION_V2_MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
+    let snapshot = build_canonical_snapshot(app)?;
+    database
+        .replace_canonical_snapshot(&snapshot)
+        .map_err(|error| format!("无法保存内置分类快照：{error}"))?;
+    fs::write(&marker, b"2\n").map_err(|error| format!("无法完成内置分类迁移：{error}"))
+}
+
 fn canonical_skill_from_installed(skill: InstalledSkill) -> Result<CanonicalSkill, String> {
     let files = collect_canonical_files(&skill)?;
     Ok(CanonicalSkill {
@@ -4101,6 +4118,8 @@ pub fn run() {
                 })?;
             let library = ensure_user_library(app.handle()).map_err(std::io::Error::other)?;
             migrate_skill_identity_v3(app.handle(), &database).map_err(std::io::Error::other)?;
+            migrate_built_in_classification_v2(app.handle(), &database)
+                .map_err(std::io::Error::other)?;
             let (event_sender, event_receiver) = mpsc::channel();
             let mut watcher = notify::recommended_watcher(move |result: notify::Result<_>| {
                 if result.is_ok() {
@@ -4394,6 +4413,40 @@ mod tests {
 
         assert!(cursor_managed_counterpart(&provisioned, &home));
         assert!(!cursor_managed_counterpart(&user, &home));
+
+        let mut skills = Vec::new();
+        let mut warnings = Vec::new();
+        let mut seen = HashSet::new();
+        scan_skill_root(
+            &portable,
+            &mut skills,
+            &mut warnings,
+            &mut seen,
+            "user",
+            false,
+            Some("cursor"),
+            false,
+        );
+        for skill in &mut skills {
+            if cursor_managed_counterpart(Path::new(&skill.path), &home) {
+                skill.is_built_in = true;
+                skill.scope = "system".to_string();
+            }
+        }
+        add_official_bundled_skills("cursor", &mut skills);
+        let canvas = skills
+            .iter()
+            .filter(|skill| skill.name == "canvas")
+            .collect::<Vec<_>>();
+        assert_eq!(canvas.len(), 1);
+        assert!(canvas[0].is_built_in);
+        assert!(
+            !skills
+                .iter()
+                .find(|skill| skill.name == "my-private-workflow")
+                .unwrap()
+                .is_built_in
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
