@@ -3131,6 +3131,22 @@ fn add_official_bundled_skills(agent: &str, skills: &mut Vec<InstalledSkill>) {
     }
 }
 
+fn cursor_managed_counterpart(skill_path: &Path, home: &Path) -> bool {
+    let portable_root = normalized_identity_path(&home.join(".agents").join("skills"));
+    let normalized_skill = normalized_identity_path(skill_path);
+    let Some(relative) = normalized_skill
+        .strip_prefix(&portable_root)
+        .and_then(|value| value.strip_prefix('/'))
+    else {
+        return false;
+    };
+    home.join(".cursor")
+        .join("skills-cursor")
+        .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join("SKILL.md")
+        .is_file()
+}
+
 fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
     let agent = agent.trim().to_ascii_lowercase();
     let home = user_home()?;
@@ -3154,6 +3170,20 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
             Some(&agent),
             false,
         );
+    }
+
+    // Cursor provisions some of its bundled Skills into the portable
+    // ~/.agents/skills directory. They remain built-in even though the portable
+    // directory is also a valid user authoring location. A matching package in
+    // Cursor's managed directory is the source evidence; unrelated user Skills
+    // in ~/.agents/skills remain unmarked.
+    if agent == "cursor" {
+        for skill in &mut skills {
+            if cursor_managed_counterpart(Path::new(&skill.path), &home) {
+                skill.is_built_in = true;
+                skill.scope = "system".to_string();
+            }
+        }
     }
 
     let managed_roots = match agent.as_str() {
@@ -4338,6 +4368,33 @@ mod tests {
                 &home,
             )
         }));
+    }
+
+    #[test]
+    fn cursor_provisioned_portable_skills_are_built_in_but_user_skills_are_not() {
+        let home = temporary_directory("cursor-provisioned-classification");
+        let portable = home.join(".agents").join("skills");
+        let managed = home.join(".cursor").join("skills-cursor");
+        let provisioned = portable.join("canvas");
+        let user = portable.join("my-private-workflow");
+        fs::create_dir_all(&provisioned).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(managed.join("canvas")).unwrap();
+        fs::write(provisioned.join("SKILL.md"), "---\nname: canvas\n---\n").unwrap();
+        fs::write(
+            user.join("SKILL.md"),
+            "---\nname: my-private-workflow\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            managed.join("canvas").join("SKILL.md"),
+            "---\nname: canvas\n---\n",
+        )
+        .unwrap();
+
+        assert!(cursor_managed_counterpart(&provisioned, &home));
+        assert!(!cursor_managed_counterpart(&user, &home));
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
