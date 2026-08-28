@@ -1751,6 +1751,30 @@ impl Database {
         Ok(())
     }
 
+    pub fn rebind_skill_identity(&self, old_id: &str, new_id: &str) -> DatabaseResult<()> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for statement in [
+            "UPDATE embeddings SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE embedding_inputs SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE analysis_rule_results SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE analysis_llm_results SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE validation_samples SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE feedback_events SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE feedback_events SET other_skill_id = ?2 WHERE other_skill_id = ?1",
+            "UPDATE skill_relations SET source_skill_id = ?2 WHERE source_skill_id = ?1",
+            "UPDATE skill_relations SET target_skill_id = ?2 WHERE target_skill_id = ?1",
+            "UPDATE indexed_skills SET skill_id = ?2 WHERE skill_id = ?1",
+        ] {
+            transaction.execute(statement, params![old_id, new_id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_analysis_results(
         &self,
         rule: &RuleAnalysisResult,
@@ -3692,6 +3716,51 @@ mod tests {
         assert!(database
             .has_analysis_for_input("skill-1", "input-1", true)
             .unwrap());
+    }
+
+    #[test]
+    fn stable_identity_migration_rebinds_existing_derived_data() {
+        let database = Database::in_memory().unwrap();
+        let profile = profile("profile-rebind", ProfileStatus::Ready);
+        database.upsert_profile(&profile).unwrap();
+        let snapshot = canonical_snapshot("snapshot-rebind", "rebind");
+        database
+            .replace_indexed_skills(&profile.profile_id, &snapshot, 1)
+            .unwrap();
+        database
+            .save_embedding(&StoredVector {
+                embedding_id: "embedding-rebind".to_string(),
+                profile_id: profile.profile_id.clone(),
+                skill_id: "skill-stable".to_string(),
+                vector_type: VectorType::OverallFunction,
+                level: VectorLevel::Parent,
+                parent_embedding_id: None,
+                resource_category: None,
+                chunk_id: None,
+                input_hash: "input-rebind".to_string(),
+                vector: vec![1.0, 0.0, 0.0],
+                status: VectorStatus::Ready,
+                heading_path: None,
+                source_file: None,
+            })
+            .unwrap();
+
+        database
+            .rebind_skill_identity("skill-stable", "skill-stable-v2")
+            .unwrap();
+        assert_eq!(
+            database.load_vectors(&profile.profile_id).unwrap()[0].skill_id,
+            "skill-stable-v2"
+        );
+        let mut migrated_snapshot = snapshot;
+        migrated_snapshot.skills[0].skill_id = "skill-stable-v2".to_string();
+        assert_eq!(
+            database
+                .compute_index_diff(&profile.profile_id, &migrated_snapshot)
+                .unwrap()
+                .unchanged,
+            1
+        );
     }
 
     #[test]

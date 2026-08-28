@@ -141,6 +141,17 @@ struct SkillFrontmatter {
     description: Option<String>,
 }
 
+const MANAGED_SKILL_ORIGIN_FILE: &str = ".deadalus-origin.json";
+const MANAGED_SKILL_HISTORY_DIR: &str = ".history";
+const SKILL_IDENTITY_V3_MARKER: &str = "skill-identity-v3.migrated";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedSkillOrigin {
+    source_path: String,
+    managed_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstalledSkill {
@@ -155,6 +166,8 @@ struct InstalledSkill {
     enabled_agents: Vec<String>,
     in_library: bool,
     library_path: Option<String>,
+    #[serde(skip_serializing, default)]
+    managed_origin: Option<String>,
     #[serde(skip_serializing, default)]
     content_hash: String,
 }
@@ -180,10 +193,10 @@ fn unix_timestamp() -> Result<u64, String> {
         .map_err(|error| format!("无法读取系统时间：{error}"))
 }
 
-fn stable_skill_id(content_hash: &str) -> String {
+fn stable_skill_id(logical_identity: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"deadalus.canonical-skill.v1\0");
-    hasher.update(content_hash.as_bytes());
+    hasher.update(b"deadalus.canonical-skill.v2\0");
+    hasher.update(logical_identity.as_bytes());
     let digest = hasher.finalize();
     let encoded = digest
         .iter()
@@ -2787,6 +2800,37 @@ fn parse_skill_frontmatter(path: &Path) -> (Option<String>, Option<String>) {
         .unwrap_or((None, None))
 }
 
+fn normalized_identity_path(path: &Path) -> String {
+    let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let value = normalized.to_string_lossy();
+    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+    if cfg!(windows) {
+        value.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        value.replace('\\', "/")
+    }
+}
+
+fn read_managed_origin(directory: &Path) -> Option<ManagedSkillOrigin> {
+    let content = fs::read_to_string(directory.join(MANAGED_SKILL_ORIGIN_FILE)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_managed_origin(directory: &Path, source: &Path) -> Result<(), String> {
+    let source_path = normalized_identity_path(source);
+    if read_managed_origin(directory).is_some_and(|origin| origin.source_path == source_path) {
+        return Ok(());
+    }
+    let origin = ManagedSkillOrigin {
+        source_path,
+        managed_at: unix_timestamp()?,
+    };
+    let content = serde_json::to_string_pretty(&origin)
+        .map_err(|error| format!("无法序列化托管 Skill 来源：{error}"))?;
+    fs::write(directory.join(MANAGED_SKILL_ORIGIN_FILE), content)
+        .map_err(|error| format!("无法保存托管 Skill 来源：{error}"))
+}
+
 fn collect_skill_files(directory: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -2797,6 +2841,9 @@ fn collect_skill_files(directory: &Path, files: &mut Vec<PathBuf>) {
             continue;
         };
         if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some(MANAGED_SKILL_ORIGIN_FILE) {
             continue;
         }
         if metadata.is_dir() {
@@ -2857,9 +2904,17 @@ fn scan_skill_directory(
             .and_then(|name| name.to_str())
             .unwrap_or("unnamed-skill")
             .to_string();
+        let managed_origin = if in_library {
+            read_managed_origin(directory).map(|origin| origin.source_path)
+        } else {
+            None
+        };
+        let logical_identity = managed_origin
+            .clone()
+            .unwrap_or_else(|| normalized_identity_path(&normalized_directory));
         let content_hash = hash_skill_directory(directory);
         skills.push(InstalledSkill {
-            skill_id: stable_skill_id(&content_hash),
+            skill_id: stable_skill_id(&logical_identity),
             name: frontmatter_name.unwrap_or(fallback_name),
             description,
             path: normalized_directory.to_string_lossy().into_owned(),
@@ -2869,6 +2924,7 @@ fn scan_skill_directory(
             enabled_agents: agent.into_iter().map(str::to_string).collect(),
             in_library,
             library_path: in_library.then(|| normalized_directory.to_string_lossy().into_owned()),
+            managed_origin,
             content_hash,
         });
         return;
@@ -2883,6 +2939,11 @@ fn scan_skill_directory(
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if directory == root
+            && path.file_name().and_then(|name| name.to_str()) == Some(MANAGED_SKILL_HISTORY_DIR)
+        {
+            continue;
+        }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -2942,7 +3003,7 @@ fn add_bundled_skill(skills: &mut Vec<InstalledSkill>, agent: &str, name: &str, 
     }
     let content_hash = format!("bundled:{agent}:{name}");
     skills.push(InstalledSkill {
-        skill_id: stable_skill_id(&content_hash),
+        skill_id: stable_skill_id(&path),
         name: name.to_string(),
         description: Some(description.to_string()),
         content_hash,
@@ -2953,6 +3014,7 @@ fn add_bundled_skill(skills: &mut Vec<InstalledSkill>, agent: &str, name: &str, 
         enabled_agents: vec![agent.to_string()],
         in_library: false,
         library_path: None,
+        managed_origin: None,
     });
 }
 
@@ -3018,9 +3080,10 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
             .map(|path| path.to_string_lossy().into_owned()),
     );
     for root in &managed_roots {
+        let mut managed_skills = Vec::new();
         scan_skill_root(
             root,
-            &mut skills,
+            &mut managed_skills,
             &mut warnings,
             &mut seen_paths,
             "system",
@@ -3028,6 +3091,24 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
             Some(&agent),
             false,
         );
+        if agent == "cursor" {
+            let portable_root = home.join(".agents").join("skills");
+            let managed_root = normalized_identity_path(root);
+            managed_skills.retain(|skill| {
+                let path = normalized_identity_path(Path::new(&skill.path));
+                let Some(relative) = path
+                    .strip_prefix(&managed_root)
+                    .and_then(|value| value.strip_prefix('/'))
+                else {
+                    return true;
+                };
+                !portable_root
+                    .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+                    .join("SKILL.md")
+                    .is_file()
+            });
+        }
+        skills.extend(managed_skills);
     }
     add_official_bundled_skills(&agent, &mut skills);
 
@@ -3055,9 +3136,66 @@ fn ensure_user_library(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn shadowed_cursor_portable_skill(origin: &str, home: &Path) -> bool {
+    let legacy_root = normalized_identity_path(&home.join(".cursor").join("skills-cursor"));
+    let portable_root = home.join(".agents").join("skills");
+    let Some(relative) = origin
+        .strip_prefix(&legacy_root)
+        .and_then(|value| value.strip_prefix('/'))
+    else {
+        return false;
+    };
+    portable_root
+        .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join("SKILL.md")
+        .is_file()
+}
+
+fn archive_shadowed_cursor_library_skills(
+    library: &Path,
+    home: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(library)
+        .map_err(|error| format!("无法读取 all_skills 以迁移 Cursor 镜像：{error}"))?;
+    for entry in entries.flatten() {
+        let target = entry.path();
+        if !target.is_dir()
+            || target.file_name().and_then(|name| name.to_str()) == Some(MANAGED_SKILL_HISTORY_DIR)
+        {
+            continue;
+        }
+        let Some(origin) = read_managed_origin(&target).map(|origin| origin.source_path) else {
+            continue;
+        };
+        if shadowed_cursor_portable_skill(&origin, home) {
+            if let Err(error) = archive_managed_library_target(library, &target, &origin) {
+                warnings.push(format!(
+                    "无法归档被 .agents/skills 取代的 Cursor 镜像 {}：{error}",
+                    target.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn merge_skill(skills: &mut HashMap<String, InstalledSkill>, incoming: InstalledSkill) {
     let key = incoming.content_hash.clone();
     if let Some(existing) = skills.get_mut(&key) {
+        if incoming
+            .managed_origin
+            .as_ref()
+            .is_some_and(|incoming_origin| {
+                existing
+                    .managed_origin
+                    .as_ref()
+                    .is_none_or(|existing_origin| incoming_origin < existing_origin)
+            })
+        {
+            existing.skill_id = incoming.skill_id.clone();
+            existing.managed_origin = incoming.managed_origin.clone();
+        }
         for agent in incoming.enabled_agents {
             if !existing.enabled_agents.contains(&agent) {
                 existing.enabled_agents.push(agent);
@@ -3107,6 +3245,111 @@ fn available_library_target(
     Err(format!("无法为 {folder_name} 分配不冲突的入库目录"))
 }
 
+fn archive_managed_library_target(
+    library: &Path,
+    target: &Path,
+    origin: &str,
+) -> Result<PathBuf, String> {
+    if !target.exists() || !is_within(target, library) {
+        return Err(format!(
+            "托管 Skill 不在 all_skills 内：{}",
+            target.display()
+        ));
+    }
+    let history = library.join(MANAGED_SKILL_HISTORY_DIR);
+    fs::create_dir_all(&history).map_err(|error| format!("无法创建 Skill 历史目录：{error}"))?;
+    let origin_key = &Sha256::digest(origin.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..12];
+    let origin_history = history.join(origin_key);
+    fs::create_dir_all(&origin_history)
+        .map_err(|error| format!("无法创建来源历史目录：{error}"))?;
+    let folder_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "无法确定托管 Skill 目录名".to_string())?;
+    let mut destination = origin_history.join(folder_name);
+    for index in 1..=999 {
+        if !destination.exists() {
+            fs::rename(target, &destination)
+                .map_err(|error| format!("无法归档旧 Skill 版本：{error}"))?;
+            return Ok(destination);
+        }
+        destination = origin_history.join(format!("{folder_name}-{index}"));
+    }
+    Err(format!("无法为 {folder_name} 分配历史归档目录"))
+}
+
+fn migrate_legacy_managed_library(
+    app: &AppHandle,
+    library: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let audit = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法确定审计目录：{error}"))?
+        .join("audit.jsonl");
+    let Ok(content) = fs::read_to_string(audit) else {
+        return Ok(());
+    };
+    migrate_legacy_managed_library_from_audit(library, &content, warnings)
+}
+
+fn migrate_legacy_managed_library_from_audit(
+    library: &Path,
+    content: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut by_origin: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for line in content.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("action").and_then(serde_json::Value::as_str) != Some("auto_sync_to_library")
+        {
+            continue;
+        }
+        let (Some(source), Some(target)) = (
+            record.get("source").and_then(serde_json::Value::as_str),
+            record.get("target").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let target = PathBuf::from(target);
+        if target.exists() && is_within(&target, library) {
+            by_origin
+                .entry(normalized_identity_path(Path::new(source)))
+                .or_default()
+                .push(target);
+        }
+    }
+    let active_targets = by_origin
+        .values()
+        .filter_map(|targets| targets.last())
+        .map(|target| normalized_identity_path(target))
+        .collect::<HashSet<_>>();
+    for (origin, targets) in by_origin {
+        let Some(active) = targets.last() else {
+            continue;
+        };
+        if let Err(error) = write_managed_origin(active, Path::new(&origin)) {
+            warnings.push(format!("无法迁移 {} 的来源记录：{error}", active.display()));
+            continue;
+        }
+        for legacy in targets.iter().take(targets.len().saturating_sub(1)) {
+            if active_targets.contains(&normalized_identity_path(legacy)) {
+                continue;
+            }
+            if let Err(error) = archive_managed_library_target(library, legacy, &origin) {
+                warnings.push(format!("无法归档旧托管版本 {}：{error}", legacy.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sync_skill_to_library(
     library: &Path,
     skill: &InstalledSkill,
@@ -3124,6 +3367,10 @@ fn sync_skill_to_library(
         let _ = fs::remove_dir_all(&target);
         return Err(error);
     }
+    if let Err(error) = write_managed_origin(&target, &source) {
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
     existing_hashes.insert(skill.content_hash.clone());
     Ok(Some(target))
 }
@@ -3133,10 +3380,55 @@ fn auto_sync_to_library(
     library: &Path,
     candidates: &[InstalledSkill],
     existing_hashes: &mut HashSet<String>,
+    managed_by_origin: &mut HashMap<String, InstalledSkill>,
     warnings: &mut Vec<String>,
 ) {
     for skill in candidates {
         let source = PathBuf::from(&skill.path);
+        let origin = normalized_identity_path(&source);
+        if let Some(existing) = managed_by_origin.get(&origin).cloned() {
+            if existing.content_hash == skill.content_hash {
+                continue;
+            }
+            let target = PathBuf::from(existing.library_path.unwrap_or(existing.path));
+            let archived = match archive_managed_library_target(library, &target, &origin) {
+                Ok(archived) => archived,
+                Err(error) => {
+                    warnings.push(format!("无法更新托管 Skill {}：{error}", skill.name));
+                    continue;
+                }
+            };
+            if let Err(error) = copy_directory(&source, &target)
+                .and_then(|_| write_managed_origin(&target, &source))
+            {
+                if target.exists() {
+                    let _ = fs::remove_dir_all(&target);
+                }
+                let restore_error = fs::rename(&archived, &target).err();
+                warnings.push(format!("无法更新托管 Skill {}：{error}", skill.name));
+                if let Some(restore_error) = restore_error {
+                    warnings.push(format!(
+                        "恢复 {} 的上一版本失败：{restore_error}",
+                        skill.name
+                    ));
+                }
+                continue;
+            }
+            existing_hashes.insert(skill.content_hash.clone());
+            let mut updated = skill.clone();
+            updated.path = target.to_string_lossy().into_owned();
+            updated.library_path = Some(updated.path.clone());
+            updated.in_library = true;
+            updated.managed_origin = Some(origin.clone());
+            managed_by_origin.insert(origin, updated);
+            if let Err(error) = append_audit(app, "auto_sync_to_library", &source, Some(&target)) {
+                warnings.push(format!(
+                    "{} 已更新入库，但审计记录失败：{error}",
+                    skill.name
+                ));
+            }
+            continue;
+        }
         let target = match sync_skill_to_library(library, skill, existing_hashes) {
             Ok(Some(target)) => target,
             Ok(None) => continue,
@@ -3151,6 +3443,12 @@ fn auto_sync_to_library(
                 skill.name
             ));
         }
+        let mut managed = skill.clone();
+        managed.path = target.to_string_lossy().into_owned();
+        managed.library_path = Some(managed.path.clone());
+        managed.in_library = true;
+        managed.managed_origin = Some(origin.clone());
+        managed_by_origin.insert(origin, managed);
     }
 }
 
@@ -3178,6 +3476,8 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
 
     let library = ensure_user_library(app)?;
     searched_paths.push(library.to_string_lossy().into_owned());
+    migrate_legacy_managed_library(app, &library, &mut warnings)?;
+    archive_shadowed_cursor_library_skills(&library, &user_home()?, &mut warnings)?;
     let mut library_skills = Vec::new();
     let mut library_seen = HashSet::new();
     scan_skill_root(
@@ -3194,11 +3494,21 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
         .iter()
         .map(|skill| skill.content_hash.clone())
         .collect();
+    let mut managed_by_origin = library_skills
+        .iter()
+        .filter_map(|skill| {
+            skill
+                .managed_origin
+                .clone()
+                .map(|origin| (origin, skill.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     auto_sync_to_library(
         app,
         &library,
         &agent_skills,
         &mut existing_hashes,
+        &mut managed_by_origin,
         &mut warnings,
     );
 
@@ -3252,6 +3562,53 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
         warnings,
         skills: canonical_skills,
     })
+}
+
+fn migrate_skill_identity_v3(app: &AppHandle, database: &Database) -> Result<(), String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法确定 Skill 身份迁移目录：{error}"))?;
+    let marker = app_data.join(SKILL_IDENTITY_V3_MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
+    let previous = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取身份迁移前快照：{error}"))?;
+    let migrated = build_canonical_snapshot(app)?;
+    if let Some(previous) = previous {
+        let migrated_by_hash = migrated
+            .skills
+            .iter()
+            .map(|skill| (skill.content_hash.as_str(), skill.skill_id.as_str()))
+            .collect::<HashMap<_, _>>();
+        for skill in &previous.skills {
+            if let Some(new_id) = migrated_by_hash.get(skill.content_hash.as_str()) {
+                database
+                    .rebind_skill_identity(&skill.skill_id, new_id)
+                    .map_err(|error| format!("无法迁移 {} 的派生数据身份：{error}", skill.name))?;
+            }
+        }
+    }
+    database
+        .replace_canonical_snapshot(&migrated)
+        .map_err(|error| format!("无法保存稳定身份快照：{error}"))?;
+    let current_ids = migrated
+        .skills
+        .iter()
+        .filter(|skill| !skill.path.starts_with("bundled://"))
+        .map(|skill| skill.skill_id.clone())
+        .collect::<Vec<_>>();
+    for profile in database
+        .list_profiles()
+        .map_err(|error| format!("无法读取身份迁移 Profiles：{error}"))?
+    {
+        database
+            .remove_deleted_profile_skills(&profile.profile_id, &current_ids)
+            .map_err(|error| format!("无法清理 {} 的旧身份索引：{error}", profile.profile_id))?;
+    }
+    fs::write(&marker, b"2\n").map_err(|error| format!("无法完成 Skill 身份迁移：{error}"))
 }
 
 fn canonical_skill_from_installed(skill: InstalledSkill) -> Result<CanonicalSkill, String> {
@@ -3402,6 +3759,7 @@ fn installed_skill_from_canonical(skill: &CanonicalSkill) -> InstalledSkill {
         enabled_agents: skill.enabled_agents.clone(),
         in_library: skill.in_library,
         library_path: skill.library_path.clone(),
+        managed_origin: None,
         content_hash: skill.content_hash.clone(),
     }
 }
@@ -3625,6 +3983,7 @@ pub fn run() {
                     std::io::Error::other(format!("无法恢复中断的本地任务：{error}"))
                 })?;
             let library = ensure_user_library(app.handle()).map_err(std::io::Error::other)?;
+            migrate_skill_identity_v3(app.handle(), &database).map_err(std::io::Error::other)?;
             let (event_sender, event_receiver) = mpsc::channel();
             let mut watcher = notify::recommended_watcher(move |result: notify::Result<_>| {
                 if result.is_ok() {
@@ -3870,10 +4229,19 @@ mod tests {
         }
 
         let response = scan_agent_skills("cursor".to_string()).expect("cursor scan should succeed");
-        assert!(response
+        let managed = response
             .skills
             .iter()
-            .any(|skill| skill.is_built_in && skill.source_path == managed_root.to_string_lossy()));
+            .filter(|skill| {
+                skill.is_built_in && skill.source_path == managed_root.to_string_lossy()
+            })
+            .collect::<Vec<_>>();
+        assert!(managed.iter().all(|skill| {
+            !shadowed_cursor_portable_skill(
+                &normalized_identity_path(Path::new(&skill.path)),
+                &home,
+            )
+        }));
     }
 
     #[test]
@@ -4264,14 +4632,17 @@ mod tests {
     }
 
     #[test]
-    fn stable_skill_ids_follow_content_identity() {
-        let content_hash = "same-content-hash";
-        assert_eq!(stable_skill_id(content_hash), stable_skill_id(content_hash));
-        assert_ne!(
-            stable_skill_id(content_hash),
-            stable_skill_id("different-content-hash")
+    fn stable_skill_ids_follow_logical_identity_not_content() {
+        let logical_identity = "c:/users/test/.agents/skills/example";
+        assert_eq!(
+            stable_skill_id(logical_identity),
+            stable_skill_id(logical_identity)
         );
-        assert!(stable_skill_id(content_hash).starts_with("skill_"));
+        assert_ne!(
+            stable_skill_id(logical_identity),
+            stable_skill_id("c:/users/test/.agents/skills/other")
+        );
+        assert!(stable_skill_id(logical_identity).starts_with("skill_"));
     }
 
     #[test]
@@ -4385,13 +4756,14 @@ mod tests {
             false,
         );
 
-        assert_eq!(discovered[0].skill_id, discovered[1].skill_id);
+        assert_ne!(discovered[0].skill_id, discovered[1].skill_id);
+        let first_id = discovered[0].skill_id.clone();
         let mut merged = HashMap::new();
         for skill in discovered {
             merge_skill(&mut merged, skill);
         }
         let skill = merged.into_values().next().expect("skill should exist");
-        assert_eq!(skill.skill_id, stable_skill_id(&skill.content_hash));
+        assert_eq!(skill.skill_id, first_id);
         assert_eq!(skill.enabled_agents, vec!["claude-code", "cursor"]);
         fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
@@ -4484,6 +4856,200 @@ mod tests {
         );
         assert_eq!(archived.len(), 2);
         assert_eq!(hashes.len(), 2);
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn managed_skill_update_keeps_identity_and_history_out_of_active_scan() {
+        let root = temporary_directory("managed-update");
+        let source_root = root.join("agent");
+        let source = source_root.join("shared");
+        let library = root.join("library");
+        fs::create_dir_all(&source).expect("source should be created");
+        fs::create_dir_all(&library).expect("library should be created");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: shared\ndescription: Version one\n---\n",
+        )
+        .expect("first version should be written");
+
+        let mut source_skills = Vec::new();
+        let mut warnings = Vec::new();
+        let mut seen = HashSet::new();
+        scan_skill_root(
+            &source_root,
+            &mut source_skills,
+            &mut warnings,
+            &mut seen,
+            "user",
+            false,
+            Some("codex"),
+            false,
+        );
+        let stable_id = source_skills[0].skill_id.clone();
+        let mut hashes = HashSet::new();
+        let target = sync_skill_to_library(&library, &source_skills[0], &mut hashes)
+            .unwrap()
+            .unwrap();
+
+        let mut library_skills = Vec::new();
+        seen.clear();
+        scan_skill_root(
+            &library,
+            &mut library_skills,
+            &mut warnings,
+            &mut seen,
+            "library",
+            false,
+            None,
+            true,
+        );
+        assert_eq!(library_skills[0].skill_id, stable_id);
+
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: shared\ndescription: Version two\n---\n",
+        )
+        .expect("second version should be written");
+        source_skills.clear();
+        seen.clear();
+        scan_skill_root(
+            &source_root,
+            &mut source_skills,
+            &mut warnings,
+            &mut seen,
+            "user",
+            false,
+            Some("codex"),
+            false,
+        );
+        assert_eq!(source_skills[0].skill_id, stable_id);
+        assert_ne!(
+            source_skills[0].content_hash,
+            library_skills[0].content_hash
+        );
+
+        let archived =
+            archive_managed_library_target(&library, &target, &normalized_identity_path(&source))
+                .expect("old version should be archived");
+        assert!(archived.join("SKILL.md").is_file());
+        copy_directory(&source, &target).expect("new version should replace active copy");
+        write_managed_origin(&target, &source).expect("origin should be preserved");
+
+        library_skills.clear();
+        seen.clear();
+        scan_skill_root(
+            &library,
+            &mut library_skills,
+            &mut warnings,
+            &mut seen,
+            "library",
+            false,
+            None,
+            true,
+        );
+        assert_eq!(library_skills.len(), 1);
+        assert_eq!(library_skills[0].skill_id, stable_id);
+        assert_eq!(
+            library_skills[0].content_hash,
+            source_skills[0].content_hash
+        );
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn legacy_audit_migration_archives_old_versions_and_marks_latest() {
+        let root = temporary_directory("legacy-managed-migration");
+        let library = root.join("library");
+        let source = root.join("agent").join("shared");
+        let old = library.join("shared");
+        let latest = library.join("shared--newhash");
+        for (directory, description) in [(&old, "Old"), (&latest, "Latest")] {
+            fs::create_dir_all(directory).expect("legacy target should be created");
+            fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: shared\ndescription: {description}\n---\n"),
+            )
+            .expect("legacy target should contain a Skill");
+        }
+        let records = [
+            serde_json::json!({
+                "action": "auto_sync_to_library",
+                "source": source,
+                "target": old,
+                "timestamp": 1
+            }),
+            serde_json::json!({
+                "action": "auto_sync_to_library",
+                "source": source,
+                "target": latest,
+                "timestamp": 2
+            }),
+        ]
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut warnings = Vec::new();
+        migrate_legacy_managed_library_from_audit(&library, &records, &mut warnings)
+            .expect("legacy migration should succeed");
+        assert!(warnings.is_empty());
+        assert!(!old.exists());
+        assert!(latest.join(MANAGED_SKILL_ORIGIN_FILE).is_file());
+
+        let mut skills = Vec::new();
+        let mut seen = HashSet::new();
+        scan_skill_root(
+            &library,
+            &mut skills,
+            &mut warnings,
+            &mut seen,
+            "library",
+            false,
+            None,
+            true,
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description.as_deref(), Some("Latest"));
+        assert!(library.join(MANAGED_SKILL_HISTORY_DIR).is_dir());
+        fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn portable_agents_skill_shadows_legacy_cursor_mirror_and_backup() {
+        let root = temporary_directory("cursor-shadow");
+        let home = root.join("home");
+        let legacy = home.join(".cursor").join("skills-cursor").join("shared");
+        let portable = home.join(".agents").join("skills").join("shared");
+        let library = root.join("library");
+        let backup = library.join("shared");
+        for directory in [&legacy, &portable, &backup] {
+            fs::create_dir_all(directory).expect("Skill directory should be created");
+            fs::write(directory.join("SKILL.md"), "---\nname: shared\n---\n")
+                .expect("Skill should be written");
+        }
+        write_managed_origin(&backup, &legacy).expect("legacy backup should be marked");
+        let origin = normalized_identity_path(&legacy);
+        assert!(shadowed_cursor_portable_skill(&origin, &home));
+
+        let mut warnings = Vec::new();
+        archive_shadowed_cursor_library_skills(&library, &home, &mut warnings)
+            .expect("shadowed backup should be archived");
+        assert!(warnings.is_empty());
+        assert!(!backup.exists());
+        assert!(library.join(MANAGED_SKILL_HISTORY_DIR).is_dir());
+
+        let unique = home
+            .join(".cursor")
+            .join("skills-cursor")
+            .join("cursor-only");
+        fs::create_dir_all(&unique).expect("unique Cursor Skill should be created");
+        fs::write(unique.join("SKILL.md"), "---\nname: cursor-only\n---\n")
+            .expect("unique Cursor Skill should be written");
+        assert!(!shadowed_cursor_portable_skill(
+            &normalized_identity_path(&unique),
+            &home
+        ));
         fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
 }
