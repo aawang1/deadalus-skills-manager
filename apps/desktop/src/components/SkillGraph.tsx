@@ -458,7 +458,7 @@ export function SkillGraph({
               return (
                 <g
                   key={node.skillId}
-                  className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`}
+                  className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${node.disabled ? " is-disabled" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`}
                   transform={`translate(${point.x} ${point.y})`}
                   tabIndex={0}
                   role="button"
@@ -663,6 +663,7 @@ function NodePopup({
         <strong>{node.name}</strong>
         <p>{node.description || "暂无简介"}</p>
         <small>{node.enabledAgents.join(" · ")}</small>
+        {node.disabled && <small>当前 Agent 中已禁用</small>}
         <code title={node.path}>{node.path}</code>
       </div>
     </foreignObject>

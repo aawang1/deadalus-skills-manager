@@ -39,6 +39,7 @@
 **/fixtures/skills/**
 **/test-data/skills/**
 **/test_data/skills/**
+skills-lock.json
 
 # Deadalus runtime data, vector indexes, and incremental caches
 **/.deadalus/**

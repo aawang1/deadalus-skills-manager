@@ -1,4 +1,4 @@
-import { type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type {
   AgentId,
@@ -29,6 +29,14 @@ export function SemanticSearch({ isNative, skills }: SemanticSearchProps) {
     "idle" | "loading" | "ready" | "error"
   >("idle");
   const [error, setError] = useState("");
+  const [includeDisabled, setIncludeDisabled] = useState(false);
+  const [preferenceBusy, setPreferenceBusy] = useState(false);
+  useEffect(() => {
+    if (!isNative) return;
+    api.getSearchPreferences()
+      .then((preferences) => setIncludeDisabled(preferences.includeDisabledSkills))
+      .catch(() => undefined);
+  }, [isNative]);
   const skillNames = useMemo(
     () => new Map(skills.map((skill) => [skill.skillId, skill.name])),
     [skills],
@@ -52,6 +60,7 @@ export function SemanticSearch({ isNative, skills }: SemanticSearchProps) {
           query.trim(),
           agent === "all" ? undefined : agent,
           vectorType === "all" ? undefined : [vectorType],
+          includeDisabled,
         ),
       );
       setState("ready");
@@ -150,6 +159,29 @@ export function SemanticSearch({ isNative, skills }: SemanticSearchProps) {
           {state === "loading" ? "检索中…" : "搜索"}
         </button>
       </form>
+      <label className="semantic-disabled-toggle">
+        <input
+          type="checkbox"
+          checked={includeDisabled}
+          disabled={!isNative || state === "loading" || preferenceBusy}
+          onChange={async (event) => {
+            const enabled = event.currentTarget.checked;
+            setIncludeDisabled(enabled);
+            setPreferenceBusy(true);
+            try {
+              const preferences = await api.setIncludeDisabledSkills(enabled);
+              setIncludeDisabled(preferences.includeDisabledSkills);
+            } catch (nextError) {
+              setIncludeDisabled(!enabled);
+              setError(String(nextError));
+              setState("error");
+            } finally {
+              setPreferenceBusy(false);
+            }
+          }}
+        />
+        <span>包含当前 Agent 中已禁用的 Skills</span>
+      </label>
 
       {!isNative && (
         <div className="semantic-state">
@@ -194,6 +226,10 @@ export function SemanticSearch({ isNative, skills }: SemanticSearchProps) {
                   {result.expired && (
                     <span className="expired-badge">索引已过期</span>
                   )}
+                  {agent !== "all" &&
+                    skills.find((skill) => skill.skillId === result.skillId)?.disabledAgents.includes(agent) && (
+                      <span className="disabled-badge">已禁用</span>
+                    )}
                   <strong>{(result.score * 100).toFixed(1)}%</strong>
                 </div>
               </header>

@@ -11,7 +11,9 @@ const skills: InstalledSkill[] = [
     scope: "user",
     isBuiltIn: false,
     enabledAgents: ["cursor", "codex"],
+    disabledAgents: [],
     inLibrary: true,
+    backupSuppressed: false,
   },
   {
     skillId: "claude-only",
@@ -21,7 +23,9 @@ const skills: InstalledSkill[] = [
     scope: "user",
     isBuiltIn: false,
     enabledAgents: ["claude-code"],
+    disabledAgents: [],
     inLibrary: false,
+    backupSuppressed: false,
   },
 ];
 

@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { api, isNativeRuntime as detectNativeRuntime } from "./api";
 import { filterCanonicalSkills } from "./canonical";
@@ -19,6 +18,7 @@ import type {
   CanonicalSnapshot,
   InstalledSkill,
   ProgressEvent,
+  SkillActionPlan,
   ViewId,
 } from "./types";
 import "./App.css";
@@ -57,6 +57,17 @@ function App() {
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(
     () => new Set(),
   );
+  const [skillActionDialog, setSkillActionDialog] = useState<{
+    plan?: SkillActionPlan;
+    skill?: InstalledSkill;
+    loading: boolean;
+    error?: string;
+  } | null>(null);
+  const [copyFailureDialog, setCopyFailureDialog] = useState<{
+    skillName: string;
+    targetName: string;
+    message: string;
+  } | null>(null);
   const keyInputRef = useRef<HTMLInputElement>(null);
   const dButtonRef = useRef<HTMLButtonElement>(null);
   const skillRefreshInFlight = useRef(false);
@@ -222,6 +233,7 @@ function App() {
     path: string,
     action: () => Promise<unknown>,
     successMessage: string,
+    onError?: (message: string) => void,
   ) => {
     setSkillAction({ path, message: "", type: "idle" });
     try {
@@ -229,11 +241,13 @@ function App() {
       setSkillAction({ path: null, message: successMessage, type: "success" });
       setLibraryVersion((version) => version + 1);
     } catch (error) {
+      const message = String(error);
       setSkillAction({
         path: null,
-        message: String(error),
+        message,
         type: "error",
       });
+      onError?.(message);
     }
   };
 
@@ -243,38 +257,88 @@ function App() {
       (agent) => !skill.enabledAgents.includes(agent.id),
     )?.id;
     const target = installTargets[skill.path] ?? firstAvailable;
-    if (!target) return;
-    const targetName = agents.find((agent) => agent.id === target)?.label;
+    if (!target) {
+      setCopyFailureDialog({
+        skillName: skill.name,
+        targetName: "目标 Agent",
+        message: "没有可用的目标 Agent，或该 Skill 已存在于所有支持的 Agent 中。",
+      });
+      return;
+    }
+    const targetName = agents.find((agent) => agent.id === target)?.label ?? target;
     if (!window.confirm(`将 ${skill.name} 复制到 ${targetName} 吗？`)) {
       return;
     }
     runSkillAction(
       skill.path,
-      () =>
-        invoke("copy_library_skill_to_agent", {
-          skillPath: skill.libraryPath,
-          agent: target,
-        }),
+      () => api.copyLibrarySkillToAgent(skill.libraryPath!, target),
       `${skill.name} 已复制到 ${targetName}。`,
+      (message) => setCopyFailureDialog({
+        skillName: skill.name,
+        targetName,
+        message,
+      }),
     );
   };
 
-  const deleteFromLibrary = (skill: InstalledSkill) => {
-    if (!skill.libraryPath) return;
-    if (
-      !window.confirm(
-        `确定从 all_skills 删除 ${skill.name} 吗？其他 Agent 中的副本不会删除。`,
-      )
-    ) {
-      return;
+  const prepareSkillAction = async (
+    skill: InstalledSkill,
+    action: "uninstall" | "disable",
+  ) => {
+    if (!activeView) return;
+    setSkillActionDialog({ skill, loading: true });
+    try {
+      const plan = await api.prepareSkillAction(skill.skillId, activeView, action);
+      setSkillActionDialog({ skill, plan, loading: false });
+    } catch (error) {
+      setSkillActionDialog({ skill, loading: false, error: String(error) });
     }
-    runSkillAction(
+  };
+
+  const executePreparedAction = async () => {
+    const dialog = skillActionDialog;
+    if (!dialog?.plan?.allowed || !dialog.skill) return;
+    const { plan, skill } = dialog;
+    setSkillActionDialog({ ...dialog, loading: true });
+    await runSkillAction(
       skill.path,
       () =>
-        invoke("delete_library_skill", {
-          skillPath: skill.libraryPath,
-        }),
-      `${skill.name} 已从 all_skills 删除。`,
+        plan.action === "uninstall"
+          ? api.uninstallSkill(skill.skillId, plan.viewId)
+          : api.disableSkillForAgent(skill.skillId, plan.viewId),
+      plan.action === "uninstall"
+        ? `${skill.name} 已从 ${plan.viewId === "all" ? "所有 Skills" : plan.viewId} 卸载。`
+        : `${skill.name} 已在当前 Agent 中禁用。`,
+    );
+    setSkillActionDialog(null);
+  };
+
+  const disableInstead = async () => {
+    const skill = skillActionDialog?.skill;
+    const viewId = skillActionDialog?.plan?.viewId;
+    if (!skill || !viewId || viewId === "all") return;
+    setSkillActionDialog({ skill, loading: true });
+    try {
+      const plan = await api.prepareSkillAction(skill.skillId, viewId, "disable");
+      setSkillActionDialog({ skill, plan, loading: false });
+    } catch (error) {
+      setSkillActionDialog({ skill, loading: false, error: String(error) });
+    }
+  };
+
+  const enableSkill = (skill: InstalledSkill, agent: AgentId) => {
+    runSkillAction(
+      skill.path,
+      () => api.enableSkillForAgent(skill.skillId, agent),
+      `${skill.name} 已在 ${agents.find((item) => item.id === agent)?.label} 中解禁。`,
+    );
+  };
+
+  const restoreBackup = (skill: InstalledSkill) => {
+    runSkillAction(
+      skill.path,
+      () => api.restoreSkillBackup(skill.skillId),
+      `${skill.name} 已重新加入所有 Skills 后备库。`,
     );
   };
 
@@ -507,6 +571,10 @@ function App() {
                   <ul className="skill-list">
                     {visibleSkills.map((skill) => {
                       const isExpanded = expandedSkills.has(skill.path);
+                      const activeAgent = activeView !== "all" ? activeView : undefined;
+                      const isDisabled = Boolean(
+                        activeAgent && skill.disabledAgents.includes(activeAgent),
+                      );
                       const availableAgents = agents.filter(
                         (agent) => !skill.enabledAgents.includes(agent.id),
                       );
@@ -515,15 +583,60 @@ function App() {
                         key={skill.skillId}
                         className={`skill-item ${
                           isExpanded ? "skill-item--expanded" : ""
-                        }`}
+                        }${isDisabled ? " skill-item--disabled" : ""}`}
                       >
                         <span className="skill-item__mark" />
                         <div className="skill-item__body">
                           <div className="skill-item__title">
-                            <p>{skill.name}</p>
-                            {skill.isBuiltIn && (
-                              <span className="skill-item__badge">内置</span>
-                            )}
+                            <div className="skill-item__identity">
+                              <p>{skill.name}</p>
+                              {skill.isBuiltIn && (
+                                <span className="skill-item__badge">内置</span>
+                              )}
+                              {isDisabled && (
+                                <span className="skill-item__badge skill-item__badge--disabled">已禁用</span>
+                              )}
+                            </div>
+                            <div className="skill-item__quick-actions">
+                              <button
+                                className="skill-quick-action skill-quick-action--uninstall"
+                                type="button"
+                                aria-label={`${activeView === "all" ? "删除后备副本" : "卸载"} ${skill.name}`}
+                                title={activeView === "all" ? "删除后备副本" : "从当前 Agent 卸载"}
+                                disabled={skillAction.path === skill.path || (activeView === "all" && !skill.inLibrary)}
+                                onClick={() => prepareSkillAction(skill, "uninstall")}
+                              >
+                                ×
+                              </button>
+                              {activeView !== "all" && activeAgent && (
+                                <button
+                                  className={`skill-quick-action ${isDisabled ? "skill-quick-action--enable" : "skill-quick-action--disable"}`}
+                                  type="button"
+                                  aria-label={`${isDisabled ? "解禁" : "禁用当前 Agent 中的"} ${skill.name}`}
+                                  title={isDisabled ? "解禁" : "禁用当前"}
+                                  disabled={skillAction.path === skill.path}
+                                  onClick={() =>
+                                    isDisabled
+                                      ? enableSkill(skill, activeAgent)
+                                      : prepareSkillAction(skill, "disable")
+                                  }
+                                >
+                                  {isDisabled ? "✓" : "−"}
+                                </button>
+                              )}
+                              {activeView === "all" && skill.backupSuppressed && (
+                                <button
+                                  className="skill-quick-action skill-quick-action--restore"
+                                  type="button"
+                                  aria-label={`重新备份 ${skill.name}`}
+                                  title="从 Agent 重新添加到所有 Skills"
+                                  disabled={skillAction.path === skill.path}
+                                  onClick={() => restoreBackup(skill)}
+                                >
+                                  ↥
+                                </button>
+                              )}
+                            </div>
                           </div>
                           {skill.description && <span>{skill.description}</span>}
                           {activeView !== "all" && (
@@ -552,13 +665,13 @@ function App() {
                                         installTargets[skill.path] ??
                                         availableAgents[0].id
                                       }
-                                      onChange={(event) =>
+                                      onChange={(event) => {
+                                        const target = event.currentTarget.value as AgentId;
                                         setInstallTargets((current) => ({
                                           ...current,
-                                          [skill.path]: event.currentTarget
-                                            .value as AgentId,
-                                        }))
-                                      }
+                                          [skill.path]: target,
+                                        }));
+                                      }}
                                     >
                                       {availableAgents.map((agent) => (
                                         <option
@@ -580,18 +693,6 @@ function App() {
                                     </button>
                                   </div>
                                 )}
-                              {skill.inLibrary &&
-                                skill.libraryPath &&
-                                skill.enabledAgents.length === 0 && (
-                                <button
-                                  className="skill-delete-button"
-                                  type="button"
-                                  disabled={skillAction.path === skill.path}
-                                  onClick={() => deleteFromLibrary(skill)}
-                                >
-                                  删除备份
-                                </button>
-                              )}
                             </div>
                           )}
                         </div>
@@ -614,6 +715,120 @@ function App() {
           </>
         )}
       </aside>
+
+      {skillActionDialog && (
+        <div className="skill-action-backdrop" role="presentation" onMouseDown={() => !skillActionDialog.loading && setSkillActionDialog(null)}>
+          <section
+            className="skill-action-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="skill-action-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <p className="eyebrow">SKILL CONTROL</p>
+                <h3 id="skill-action-title">
+                  {skillActionDialog.plan?.action === "disable" ? "禁用当前 Agent" : "确认卸载"}
+                </h3>
+              </div>
+              <button type="button" className="modal-close" aria-label="关闭" disabled={skillActionDialog.loading} onClick={() => setSkillActionDialog(null)}>×</button>
+            </header>
+            {skillActionDialog.loading && <div className="skill-action-dialog__state"><span className="spinner" />正在核对实际影响范围…</div>}
+            {skillActionDialog.error && <p className="skill-action-dialog__error">{skillActionDialog.error}</p>}
+            {skillActionDialog.plan && !skillActionDialog.loading && (
+              <>
+                <strong>{skillActionDialog.plan.skillName}</strong>
+                <p>
+                  {skillActionDialog.plan.action === "disable"
+                    ? `只禁用 ${skillActionDialog.plan.viewId}，不会删除 Skill 文件或向量。`
+                    : skillActionDialog.plan.viewId === "all"
+                      ? "后备副本将被删除，并停止在后续扫描中自动重新备份。"
+                      : `将从 ${skillActionDialog.plan.viewId} 的实际安装位置卸载。`}
+                </p>
+                {skillActionDialog.plan.sharedInstallation && (
+                  <div className="skill-action-dialog__impact">
+                    此路径同时被以下 Agent 使用：{skillActionDialog.plan.affectedAgents.join("、")}。继续卸载会同时影响它们。
+                  </div>
+                )}
+                {skillActionDialog.plan.pluginOperation && (
+                  <div className="skill-action-dialog__impact">该 Skill 由插件提供，卸载可能同时影响插件内其他 Skills。</div>
+                )}
+                {skillActionDialog.plan.symbolicLinkOnly && (
+                  <div className="skill-action-dialog__note">只会移除符号链接，不会删除链接目标内容。</div>
+                )}
+                {skillActionDialog.plan.targetPaths.length > 0 && (
+                  <details>
+                    <summary>实际目标 · {skillActionDialog.plan.targetPaths.length}</summary>
+                    {skillActionDialog.plan.targetPaths.map((path) => <code key={path}>{path}</code>)}
+                  </details>
+                )}
+                {!skillActionDialog.plan.allowed && (
+                  <p className="skill-action-dialog__error">{skillActionDialog.plan.reason}</p>
+                )}
+                <footer>
+                  {skillActionDialog.plan.action === "uninstall" && skillActionDialog.plan.viewId !== "all" && (
+                    <button type="button" className="warning-button" onClick={disableInstead}>禁用当前</button>
+                  )}
+                  <button type="button" onClick={() => setSkillActionDialog(null)}>取消</button>
+                  <button
+                    type="button"
+                    className={skillActionDialog.plan.action === "uninstall" ? "danger-button" : "warning-button"}
+                    disabled={!skillActionDialog.plan.allowed}
+                    onClick={executePreparedAction}
+                  >
+                    {skillActionDialog.plan.action === "uninstall" ? "确认卸载" : "确认禁用"}
+                  </button>
+                </footer>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
+      {copyFailureDialog && (
+        <div
+          className="skill-action-backdrop"
+          role="presentation"
+          onMouseDown={() => setCopyFailureDialog(null)}
+        >
+          <section
+            className="skill-action-dialog copy-failure-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="copy-failure-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <p className="eyebrow">SKILL COPY</p>
+                <h3 id="copy-failure-title">复制失败</h3>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="关闭复制失败提醒"
+                onClick={() => setCopyFailureDialog(null)}
+              >
+                ×
+              </button>
+            </header>
+            <strong>{copyFailureDialog.skillName}</strong>
+            <p>未能复制到 {copyFailureDialog.targetName}。</p>
+            <div className="skill-action-dialog__impact copy-failure-dialog__reason">
+              {copyFailureDialog.message}
+            </div>
+            <p className="copy-failure-dialog__hint">
+              可能原因包括目标已存在、Skill 包结构无效、包含不可复制的链接、目录权限不足，或目标 Agent 不兼容。
+            </p>
+            <footer>
+              <button type="button" onClick={() => setCopyFailureDialog(null)}>
+                知道了
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       <main className="main-platform" aria-label="A1 可视化工作区">
         {activeView && (

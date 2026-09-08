@@ -23,6 +23,8 @@ import type {
   ProgressEvent,
   ProviderModelsResponse,
   SemanticSearchResult,
+  SearchPreferences,
+  SkillActionPlan,
   SkillGraphSnapshot,
   SkillRelationship,
   ToastMessage,
@@ -38,6 +40,18 @@ export const api = {
     invoke<CanonicalSnapshot>("get_canonical_skills_snapshot"),
   refreshCanonicalSkillsSnapshot: () =>
     invoke<CanonicalSnapshot>("refresh_canonical_skills_snapshot"),
+  prepareSkillAction: (skillId: string, viewId: string, action: "uninstall" | "disable") =>
+    invoke<SkillActionPlan>("prepare_skill_action", { skillId, viewId, action }),
+  uninstallSkill: (skillId: string, viewId: string) =>
+    invoke<CanonicalSnapshot>("uninstall_skill", { skillId, viewId }),
+  disableSkillForAgent: (skillId: string, agent: string) =>
+    invoke<CanonicalSnapshot>("disable_skill_for_agent", { skillId, agent }),
+  enableSkillForAgent: (skillId: string, agent: string) =>
+    invoke<CanonicalSnapshot>("enable_skill_for_agent", { skillId, agent }),
+  restoreSkillBackup: (skillId: string) =>
+    invoke<CanonicalSnapshot>("restore_skill_backup", { skillId }),
+  copyLibrarySkillToAgent: (skillPath: string, agent: string) =>
+    invoke<void>("copy_library_skill_to_agent", { skillPath, agent }),
 
   listApiKeys: () => invoke<ApiKeyMetadata[]>("list_api_keys"),
   saveApiKey: (provider: string, apiKey: string) =>
@@ -128,12 +142,18 @@ export const api = {
     query: string,
     agentFilter?: string,
     vectorTypes?: VectorType[],
+    includeDisabledSkills?: boolean,
   ) =>
     invoke<SemanticSearchResult[]>("semantic_search", {
       query,
       agentFilter,
       vectorTypes,
+      includeDisabledSkills,
     }),
+  getSearchPreferences: () =>
+    invoke<SearchPreferences>("get_search_preferences"),
+  setIncludeDisabledSkills: (enabled: boolean) =>
+    invoke<SearchPreferences>("set_include_disabled_skills", { enabled }),
   listSkillRelations: (skillId: string, profileId?: string) =>
     invoke<SkillRelationship[]>("list_skill_relations", {
       skillId,

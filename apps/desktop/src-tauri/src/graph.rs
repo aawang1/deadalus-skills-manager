@@ -38,6 +38,7 @@ pub struct SkillGraphNode {
     pub cluster_id: Option<String>,
     pub centrality: f32,
     pub superseded: bool,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -136,6 +137,20 @@ pub fn build_skill_graph(
         })
         .collect::<BTreeMap<_, _>>();
     let excluded_unready_count = visible_skills.len().saturating_sub(ready_skills.len());
+    let disabled_ids = if view_id == "all" {
+        HashSet::new()
+    } else {
+        ready_skills
+            .iter()
+            .filter(|(_, (skill, _))| skill.disabled_agents.iter().any(|agent| agent == view_id))
+            .map(|(skill_id, _)| skill_id.clone())
+            .collect::<HashSet<_>>()
+    };
+    let active_ready_skills = ready_skills
+        .iter()
+        .filter(|(skill_id, _)| !disabled_ids.contains(*skill_id))
+        .map(|(skill_id, value)| (skill_id.clone(), *value))
+        .collect::<BTreeMap<_, _>>();
     let relevant_relationships = relationships
         .iter()
         .filter(|relation| relation_belongs_to_profile(relation, profile_id))
@@ -151,8 +166,8 @@ pub fn build_skill_graph(
         .collect::<HashSet<_>>();
 
     let mut similarities = Vec::new();
-    let ready_ids = ready_skills.keys().cloned().collect::<Vec<_>>();
-    let normalized_vectors = ready_skills
+    let ready_ids = active_ready_skills.keys().cloned().collect::<Vec<_>>();
+    let normalized_vectors = active_ready_skills
         .iter()
         .filter_map(|(skill_id, (_, vector))| {
             normalize(&vector.vector).map(|normalized| (skill_id.clone(), normalized))
@@ -187,7 +202,7 @@ pub fn build_skill_graph(
 
     let excluded_unconnected_count = 0;
     let (clusters, cluster_by_skill, centrality_by_skill) =
-        build_clusters(&ready_skills, &similarities);
+        build_clusters(&active_ready_skills, &similarities);
     let superseded_ids = confirmed_superseded_ids(&relevant_relationships);
     let nodes = ready_skills
         .values()
@@ -197,11 +212,13 @@ pub fn build_skill_graph(
                 cluster_by_skill.get(&skill.skill_id).cloned(),
                 *centrality_by_skill.get(&skill.skill_id).unwrap_or(&0.0),
                 superseded_ids.contains(&skill.skill_id),
+                disabled_ids.contains(&skill.skill_id),
             )
         })
         .collect::<Vec<_>>();
     let node_ids = nodes
         .iter()
+        .filter(|node| !node.disabled)
         .map(|node| node.skill_id.clone())
         .collect::<HashSet<_>>();
 
@@ -315,6 +332,7 @@ fn graph_node(
     cluster_id: Option<String>,
     centrality: f32,
     superseded: bool,
+    disabled: bool,
 ) -> SkillGraphNode {
     SkillGraphNode {
         skill_id: skill.skill_id.clone(),
@@ -325,6 +343,7 @@ fn graph_node(
         cluster_id,
         centrality,
         superseded,
+        disabled,
     }
 }
 
@@ -698,12 +717,13 @@ fn graph_version(
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
         parts.push(format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             node.skill_id,
             node.name,
             node.description.as_deref().unwrap_or_default(),
             node.path,
             node.enabled_agents.join(","),
+            node.disabled,
             vector_version,
         ));
     }
@@ -760,7 +780,10 @@ fn layout_version(
             .get(&node.skill_id)
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
-        parts.push(format!("{}:{}", node.skill_id, vector_version));
+        parts.push(format!(
+            "{}:{}:{}",
+            node.skill_id, node.disabled, vector_version
+        ));
     }
     stable_hash(parts.join("\n").as_bytes())
 }
@@ -805,8 +828,10 @@ mod tests {
             scope: "user".to_string(),
             is_built_in: false,
             enabled_agents: vec![agent.to_string()],
+            disabled_agents: Vec::new(),
             in_library: false,
             library_path: None,
+            backup_suppressed: false,
             content_hash: format!("hash-{id}"),
             files: Vec::<CanonicalFile>::new(),
         }
@@ -975,6 +1000,33 @@ mod tests {
         assert!(graph.edges.is_empty());
         assert_eq!(graph.excluded_unconnected_count, 0);
         assert!(graph.nodes[0].cluster_id.is_none());
+    }
+
+    #[test]
+    fn disabled_skill_remains_visible_only_in_its_agent_view_without_relations() {
+        let mut disabled = skill("disabled", "cursor");
+        disabled.disabled_agents.push("cursor".to_string());
+        let source = snapshot(vec![disabled, skill("active", "cursor")]);
+        let vectors = [
+            vector("disabled", vec![1.0, 0.0]),
+            vector("active", vec![0.99, 0.01]),
+        ];
+        let agent_graph = build_skill_graph(&source, "profile", &vectors, &[], "cursor");
+        assert_eq!(agent_graph.nodes.len(), 2);
+        assert!(
+            agent_graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "disabled")
+                .unwrap()
+                .disabled
+        );
+        assert!(agent_graph.edges.is_empty());
+        assert!(agent_graph.proximities.is_empty());
+
+        let all_graph = build_skill_graph(&source, "profile", &vectors, &[], "all");
+        assert!(!all_graph.nodes.iter().any(|node| node.disabled));
+        assert_eq!(all_graph.edges.len(), 1);
     }
 
     #[test]

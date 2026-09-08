@@ -6,11 +6,15 @@ import { SemanticSearch } from "./SemanticSearch";
 
 const mocks = vi.hoisted(() => ({
   semanticSearch: vi.fn(),
+  getSearchPreferences: vi.fn(),
+  setIncludeDisabledSkills: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
   api: {
     semanticSearch: mocks.semanticSearch,
+    getSearchPreferences: mocks.getSearchPreferences,
+    setIncludeDisabledSkills: mocks.setIncludeDisabledSkills,
   },
 }));
 
@@ -23,12 +27,20 @@ const skills: InstalledSkill[] = [
     scope: "user",
     isBuiltIn: false,
     enabledAgents: ["cursor"],
+    disabledAgents: [],
     inLibrary: true,
+    backupSuppressed: false,
   },
 ];
 
 describe("SemanticSearch", () => {
-  beforeEach(() => mocks.semanticSearch.mockReset());
+  beforeEach(() => {
+    mocks.semanticSearch.mockReset();
+    mocks.getSearchPreferences.mockResolvedValue({ includeDisabledSkills: false });
+    mocks.setIncludeDisabledSkills.mockImplementation((enabled: boolean) =>
+      Promise.resolve({ includeDisabledSkills: enabled }),
+    );
+  });
 
   it("renders the zero-result state", async () => {
     mocks.semanticSearch.mockResolvedValue([]);
@@ -108,5 +120,15 @@ describe("SemanticSearch", () => {
     ).toHaveValue("all");
     expect(screen.getByText("输入任务描述开始搜索")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "清空历史" })).toBeDisabled();
+  });
+
+  it("persists the include-disabled search preference", async () => {
+    const user = userEvent.setup();
+    render(<SemanticSearch isNative skills={skills} />);
+    const toggle = await screen.findByRole("checkbox", {
+      name: "包含当前 Agent 中已禁用的 Skills",
+    });
+    await user.click(toggle);
+    expect(mocks.setIncludeDisabledSkills).toHaveBeenCalledWith(true);
   });
 });

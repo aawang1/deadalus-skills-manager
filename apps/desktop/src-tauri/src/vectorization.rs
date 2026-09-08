@@ -641,7 +641,18 @@ fn build_input(
     sections: &[MarkdownSection],
     config: &InputGenerationConfig,
 ) -> GeneratedInput {
-    let text = render_parent_text(&parent);
+    let full_text = render_parent_text(&parent);
+    let parent_is_oversized =
+        estimate_tokens_bounded(&full_text, config.max_parent_tokens) > config.max_parent_tokens;
+    // A Parent is an indexable structural summary, not a second copy of every
+    // source section. Keep its text inside the active profile's input budget;
+    // the complete detail remains available through the generated chunks and
+    // the structured parent payload.
+    let text = if parent_is_oversized {
+        truncate_to_token_limit(&full_text, config.max_parent_tokens.max(1))
+    } else {
+        full_text
+    };
     let input_hash = stable_hash(text.as_bytes());
     let identity = format!(
         "{}\0{}\0{}\0{}",
@@ -651,24 +662,23 @@ fn build_input(
         INPUT_SCHEMA_VERSION
     );
     let input_id = format!("input_{}", &stable_hash(identity.as_bytes())[..32]);
-    let chunks =
-        if estimate_tokens_bounded(&text, config.max_parent_tokens) > config.max_parent_tokens {
-            sections
-                .iter()
-                .flat_map(|section| {
-                    chunk_section(
-                        relative_file_path,
-                        parent.vector_type,
-                        parent.resource_category.as_deref(),
-                        section,
-                        config.max_chunk_tokens.max(1),
-                        config.overlap_percent.min(50),
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let chunks = if parent_is_oversized {
+        sections
+            .iter()
+            .flat_map(|section| {
+                chunk_section(
+                    relative_file_path,
+                    parent.vector_type,
+                    parent.resource_category.as_deref(),
+                    section,
+                    config.max_chunk_tokens.max(1),
+                    config.overlap_percent.min(50),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     GeneratedInput {
         input_id,
         parent,
@@ -676,6 +686,32 @@ fn build_input(
         input_hash,
         chunks,
     }
+}
+
+fn truncate_to_token_limit(text: &str, max_tokens: usize) -> String {
+    let spans = text_spans(text);
+    if spans.is_empty() {
+        return String::new();
+    }
+    let mut used = 0usize;
+    let mut byte_end = 0usize;
+    for span in spans {
+        if used.saturating_add(span.tokens) > max_tokens {
+            // A single long ASCII token can itself exceed the budget. Preserve
+            // a bounded prefix instead of producing an empty Parent.
+            if byte_end == 0 {
+                byte_end = text
+                    .char_indices()
+                    .nth(max_tokens.saturating_mul(4))
+                    .map(|(index, _)| index)
+                    .unwrap_or(text.len());
+            }
+            break;
+        }
+        used = used.saturating_add(span.tokens);
+        byte_end = span.end;
+    }
+    text[..byte_end].trim().to_string()
 }
 
 fn render_parent_text(parent: &StructuredParentInput) -> String {
@@ -1156,6 +1192,7 @@ Preserve page numbers in every citation.
             .iter()
             .find(|input| input.parent.vector_type == VectorType::Workflow)
             .expect("workflow should exist");
+        assert!(estimate_tokens(&workflow.text) <= config.max_parent_tokens);
         assert!(workflow.chunks.len() > 1);
         assert!(workflow
             .chunks
@@ -1170,5 +1207,23 @@ Preserve page numbers in every citation.
     fn bounded_estimator_stops_after_limit() {
         assert_eq!(estimate_tokens_bounded("one two three four", 2), 3);
         assert!(estimate_tokens("你好 world") >= 3);
+    }
+
+    #[test]
+    fn oversized_unbroken_parent_is_non_empty_and_bounded() {
+        let markdown = format!("# Notes\n{}", "a".repeat(100_000));
+        let config = InputGenerationConfig {
+            max_parent_tokens: 100,
+            max_chunk_tokens: 80,
+            overlap_percent: 10,
+        };
+        let inputs = generate_inputs("large/SKILL.md", &markdown, &config);
+        let general = inputs
+            .iter()
+            .find(|input| input.parent.vector_type == VectorType::General)
+            .expect("general input should exist");
+        assert!(!general.text.is_empty());
+        assert!(estimate_tokens(&general.text) <= config.max_parent_tokens);
+        assert!(!general.chunks.is_empty());
     }
 }

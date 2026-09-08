@@ -19,6 +19,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 use uuid::Uuid;
 
 use adaptive::{
@@ -30,8 +31,9 @@ use application::{
     AnalysisRequest, QueryVectors, RetrievalConfig,
 };
 use database::{
-    AdaptiveHistoryRecord, CanonicalFile, CanonicalSkill, CanonicalSnapshot, Database,
-    FeedbackEventRecord, LocalValidationMutation, ValidationRunRecord, ValidationSampleRecord,
+    AdaptiveHistoryRecord, AgentSkillState, CanonicalFile, CanonicalSkill, CanonicalSnapshot,
+    Database, FeedbackEventRecord, LocalValidationMutation, ValidationRunRecord,
+    ValidationSampleRecord,
 };
 use graph::{build_skill_graph, empty_graph, SkillGraphSnapshot};
 use pipeline::{
@@ -144,7 +146,7 @@ struct SkillFrontmatter {
 const MANAGED_SKILL_ORIGIN_FILE: &str = ".deadalus-origin.json";
 const MANAGED_SKILL_HISTORY_DIR: &str = ".history";
 const SKILL_IDENTITY_V3_MARKER: &str = "skill-identity-v3.migrated";
-const BUILT_IN_CLASSIFICATION_V2_MARKER: &str = "built-in-classification-v2.migrated";
+const BUILT_IN_CLASSIFICATION_V3_MARKER: &str = "built-in-classification-v3.migrated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,12 +167,34 @@ struct InstalledSkill {
     scope: String,
     is_built_in: bool,
     enabled_agents: Vec<String>,
+    #[serde(default)]
+    disabled_agents: Vec<String>,
     in_library: bool,
     library_path: Option<String>,
+    #[serde(default)]
+    backup_suppressed: bool,
     #[serde(skip_serializing, default)]
     managed_origin: Option<String>,
     #[serde(skip_serializing, default)]
     content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillActionPlan {
+    skill_id: String,
+    skill_name: String,
+    view_id: String,
+    action: String,
+    allowed: bool,
+    reason: Option<String>,
+    target_paths: Vec<String>,
+    affected_agents: Vec<String>,
+    shared_installation: bool,
+    plugin_operation: bool,
+    symbolic_link_only: bool,
+    keeps_library_copy: bool,
+    keeps_other_agents: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1269,7 +1293,7 @@ fn scan_embedding_changes(
     app: AppHandle,
     database: State<'_, Database>,
 ) -> Result<IndexDiff, String> {
-    let snapshot = build_canonical_snapshot(&app)?;
+    let snapshot = build_canonical_snapshot(&app, database.inner())?;
     database
         .replace_canonical_snapshot(&snapshot)
         .map_err(|error| format!("无法保存变更扫描快照：{error}"))?;
@@ -1704,6 +1728,7 @@ async fn semantic_search(
     query: String,
     agent_filter: Option<String>,
     vector_types: Option<Vec<VectorType>>,
+    include_disabled_skills: Option<bool>,
 ) -> Result<Vec<SearchResult>, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -1743,6 +1768,11 @@ async fn semantic_search(
     let snapshot = database
         .current_canonical_snapshot()
         .map_err(|error| format!("无法读取规范快照：{error}"))?;
+    let include_disabled_skills = include_disabled_skills.unwrap_or(
+        database
+            .include_disabled_search()
+            .map_err(|error| format!("无法读取搜索设置：{error}"))?,
+    );
     let allowed = snapshot
         .as_ref()
         .map(|snapshot| snapshot_for_embedding(database.inner(), snapshot))
@@ -1754,6 +1784,11 @@ async fn semantic_search(
                 .filter(|skill| {
                     agent_filter.as_ref().is_none_or(|agent| {
                         skill.enabled_agents.iter().any(|enabled| enabled == agent)
+                            && (include_disabled_skills
+                                || !skill
+                                    .disabled_agents
+                                    .iter()
+                                    .any(|disabled| disabled == agent))
                     })
                 })
                 .map(|skill| skill.skill_id)
@@ -2824,20 +2859,94 @@ fn agent_configuration(agent: &str, home: &Path) -> Result<(Vec<PathBuf>, &'stat
     match agent {
         "claude-code" => Ok((
             vec![home.join(".claude").join("skills")],
-            "https://docs.anthropic.com/en/docs/claude-code/skills",
+            "https://code.claude.com/docs/en/skills",
         )),
         "cursor" => Ok((
             vec![
                 home.join(".cursor").join("skills"),
                 home.join(".agents").join("skills"),
+                home.join(".claude").join("skills"),
+                home.join(".codex").join("skills"),
             ],
             "https://cursor.com/docs/skills",
         )),
         "codex" => Ok((
-            vec![home.join(".agents").join("skills")],
-            "https://developers.openai.com/codex/skills",
+            vec![
+                home.join(".agents").join("skills"),
+                // The bundled skill-installer still installs personal Skills
+                // into $CODEX_HOME/skills (normally ~/.codex/skills). Keep this
+                // compatibility root alongside the current ~/.agents/skills
+                // convention so existing installations remain discoverable.
+                home.join(".codex").join("skills"),
+            ],
+            "https://learn.chatgpt.com/zh-Hans/docs/build-skills",
         )),
         _ => Err("未知 Agent".to_string()),
+    }
+}
+
+fn repository_ancestor_directories_from(start: &Path) -> Vec<PathBuf> {
+    let mut current = start.to_path_buf();
+    let mut directories = Vec::new();
+    loop {
+        directories.push(current.clone());
+        if current.join(".git").exists() {
+            return directories;
+        }
+        if !current.pop() {
+            // Outside a repository, only the actual working directory is a
+            // meaningful project scope. Do not probe arbitrary ancestors.
+            return directories.into_iter().take(1).collect();
+        }
+    }
+}
+
+fn project_skill_roots_from(agent: &str, start: &Path) -> Vec<PathBuf> {
+    let relative_roots: &[&[&str]] = match agent {
+        "claude-code" => &[&[".claude", "skills"]],
+        "cursor" => &[
+            &[".agents", "skills"],
+            &[".cursor", "skills"],
+            // Cursor officially supports Claude and Codex project locations
+            // for cross-agent compatibility.
+            &[".claude", "skills"],
+            &[".codex", "skills"],
+        ],
+        "codex" => &[&[".agents", "skills"]],
+        _ => &[],
+    };
+    repository_ancestor_directories_from(start)
+        .into_iter()
+        .flat_map(|directory| {
+            relative_roots.iter().map(move |segments| {
+                segments
+                    .iter()
+                    .fold(directory.clone(), |path, segment| path.join(segment))
+            })
+        })
+        .collect()
+}
+
+fn project_skill_roots(agent: &str) -> Vec<PathBuf> {
+    std::env::current_dir()
+        .map(|current| project_skill_roots_from(agent, &current))
+        .unwrap_or_default()
+}
+
+fn normalized_path_is_within(path: &Path, root: &Path) -> bool {
+    let path = normalized_identity_path(path);
+    let root = normalized_identity_path(root);
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|relative| relative.starts_with('/'))
+}
+
+fn managed_skill_roots(agent: &str, home: &Path) -> Vec<PathBuf> {
+    match agent {
+        "cursor" => vec![home.join(".cursor").join("skills-cursor")],
+        "codex" => vec![home.join(".codex").join("skills").join(".system")],
+        _ => Vec::new(),
     }
 }
 
@@ -2981,8 +3090,10 @@ fn scan_skill_directory(
             scope: scope.to_string(),
             is_built_in,
             enabled_agents: agent.into_iter().map(str::to_string).collect(),
+            disabled_agents: Vec::new(),
             in_library,
             library_path: in_library.then(|| normalized_directory.to_string_lossy().into_owned()),
+            backup_suppressed: false,
             managed_origin,
             content_hash,
         });
@@ -3071,8 +3182,10 @@ fn add_bundled_skill(skills: &mut Vec<InstalledSkill>, agent: &str, name: &str, 
         scope: "system".to_string(),
         is_built_in: true,
         enabled_agents: vec![agent.to_string()],
+        disabled_agents: Vec::new(),
         in_library: false,
         library_path: None,
+        backup_suppressed: false,
         managed_origin: None,
     });
 }
@@ -3094,15 +3207,11 @@ fn add_official_bundled_skills(agent: &str, skills: &mut Vec<InstalledSkill>) {
                 add_bundled_skill(skills, agent, name, description);
             }
         }
-        "codex" => {
-            for (name, description) in [
-                ("skill-creator", "创建或更新 Agent Skill"),
-                ("skill-installer", "安装官方精选或仓库中的 Agent Skill"),
-                ("plan", "为开发任务生成和维护实施计划"),
-            ] {
-                add_bundled_skill(skills, agent, name, description);
-            }
-        }
+        // Codex exposes its system Skills as real packages under
+        // ~/.codex/skills/.system. Do not add a second hard-coded virtual
+        // catalog here: stale virtual entries have no path that
+        // [[skills.config]] can target and therefore cannot be disabled.
+        "codex" => {}
         "cursor" => {
             for (name, description) in [
                 ("automate", "创建由计划或外部事件触发的自动化"),
@@ -3152,8 +3261,10 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
     let agent = agent.trim().to_ascii_lowercase();
     let home = user_home()?;
     let (roots, official_documentation) = agent_configuration(&agent, &home)?;
+    let project_roots = project_skill_roots(&agent);
     let mut searched_paths: Vec<String> = roots
         .iter()
+        .chain(project_roots.iter())
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     let mut skills = Vec::new();
@@ -3172,6 +3283,33 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
             false,
         );
     }
+    for root in &project_roots {
+        scan_skill_root(
+            root,
+            &mut skills,
+            &mut warnings,
+            &mut seen_paths,
+            "project",
+            false,
+            Some(&agent),
+            false,
+        );
+    }
+
+    // ~/.codex/skills is both the legacy/present installer destination and
+    // the parent of the real bundled .system packages. Classify descendants
+    // of .system as built-in even when they were first found through the
+    // compatibility parent root.
+    if agent == "codex" {
+        let system_root = home.join(".codex").join("skills").join(".system");
+        for skill in &mut skills {
+            if normalized_path_is_within(Path::new(&skill.path), &system_root) {
+                skill.is_built_in = true;
+                skill.scope = "system".to_string();
+                skill.source_path = system_root.to_string_lossy().into_owned();
+            }
+        }
+    }
 
     // Cursor provisions some of its bundled Skills into the portable
     // ~/.agents/skills directory. They remain built-in even though the portable
@@ -3187,11 +3325,7 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
         }
     }
 
-    let managed_roots = match agent.as_str() {
-        "cursor" => vec![home.join(".cursor").join("skills-cursor")],
-        "codex" => vec![home.join(".codex").join("skills").join(".system")],
-        _ => Vec::new(),
-    };
+    let managed_roots = managed_skill_roots(&agent, &home);
     searched_paths.extend(
         managed_roots
             .iter()
@@ -3230,6 +3364,8 @@ fn scan_agent_skills(agent: String) -> Result<AgentSkillsResponse, String> {
     }
     add_official_bundled_skills(&agent, &mut skills);
 
+    searched_paths.sort();
+    searched_paths.dedup();
     skills.sort_by_key(|skill| skill.name.to_lowercase());
 
     Ok(AgentSkillsResponse {
@@ -3499,9 +3635,13 @@ fn auto_sync_to_library(
     candidates: &[InstalledSkill],
     existing_hashes: &mut HashSet<String>,
     managed_by_origin: &mut HashMap<String, InstalledSkill>,
+    excluded_skill_ids: &HashSet<String>,
     warnings: &mut Vec<String>,
 ) {
     for skill in candidates {
+        if excluded_skill_ids.contains(&skill.skill_id) {
+            continue;
+        }
         let source = PathBuf::from(&skill.path);
         let origin = normalized_identity_path(&source);
         if let Some(existing) = managed_by_origin.get(&origin).cloned() {
@@ -3570,7 +3710,10 @@ fn auto_sync_to_library(
     }
 }
 
-fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String> {
+fn build_canonical_snapshot(
+    app: &AppHandle,
+    database: &Database,
+) -> Result<CanonicalSnapshot, String> {
     let scan_started_at =
         i64::try_from(unix_timestamp()?).map_err(|_| "扫描时间超出支持范围".to_string())?;
     let mut merged = HashMap::new();
@@ -3589,6 +3732,31 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
                 }
             }
             Err(error) => warnings.push(format!("{agent}：{error}")),
+        }
+    }
+
+    let current_agent_skill_ids = agent_skills
+        .iter()
+        .map(|skill| skill.skill_id.clone())
+        .collect::<HashSet<_>>();
+    let exclusions = database
+        .backup_exclusions()
+        .map_err(|error| format!("无法读取停止备份记录：{error}"))?;
+    let mut excluded_skill_ids = HashSet::new();
+    for exclusion in exclusions {
+        if current_agent_skill_ids.contains(&exclusion.skill_id) {
+            if exclusion.missing_seen {
+                database
+                    .clear_backup_exclusion(&exclusion.skill_id)
+                    .map_err(|error| format!("无法清除重新安装 Skill 的停止备份记录：{error}"))?;
+            } else {
+                excluded_skill_ids.insert(exclusion.skill_id);
+            }
+        } else {
+            database
+                .mark_backup_exclusion_missing(&exclusion.skill_id)
+                .map_err(|error| format!("无法更新停止备份记录：{error}"))?;
+            excluded_skill_ids.insert(exclusion.skill_id);
         }
     }
 
@@ -3627,6 +3795,7 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
         &agent_skills,
         &mut existing_hashes,
         &mut managed_by_origin,
+        &excluded_skill_ids,
         &mut warnings,
     );
 
@@ -3656,10 +3825,52 @@ fn build_canonical_snapshot(app: &AppHandle) -> Result<CanonicalSnapshot, String
             .then_with(|| left.content_hash.cmp(&right.content_hash))
     });
 
-    let canonical_skills = skills
+    let mut canonical_skills = skills
         .into_iter()
         .map(canonical_skill_from_installed)
         .collect::<Result<Vec<_>, _>>()?;
+    for state in database
+        .agent_skill_states()
+        .map_err(|error| format!("无法读取 Agent Skill 禁用状态：{error}"))?
+    {
+        let target_index = canonical_skills
+            .iter()
+            .position(|skill| skill.skill_id == state.skill_id)
+            .or_else(|| {
+                canonical_skills
+                    .iter()
+                    .position(|skill| skill.content_hash == state.skill.content_hash)
+            });
+        if let Some(target_index) = target_index {
+            let skill = &mut canonical_skills[target_index];
+            if !skill.enabled_agents.contains(&state.agent_id) {
+                skill.enabled_agents.push(state.agent_id.clone());
+                skill.enabled_agents.sort();
+            }
+            if !skill.disabled_agents.contains(&state.agent_id) {
+                skill.disabled_agents.push(state.agent_id.clone());
+                skill.disabled_agents.sort();
+            }
+        } else {
+            let mut skill = state.skill;
+            if !skill.enabled_agents.contains(&state.agent_id) {
+                skill.enabled_agents.push(state.agent_id.clone());
+            }
+            skill.disabled_agents = vec![state.agent_id];
+            canonical_skills.push(skill);
+        }
+    }
+    for skill in &mut canonical_skills {
+        if excluded_skill_ids.contains(&skill.skill_id) {
+            skill.backup_suppressed = true;
+        }
+    }
+    canonical_skills.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.content_hash.cmp(&right.content_hash))
+    });
     let content_hash = serde_json::to_vec(&canonical_skills)
         .map(|value| {
             let digest = Sha256::digest(value);
@@ -3694,7 +3905,7 @@ fn migrate_skill_identity_v3(app: &AppHandle, database: &Database) -> Result<(),
     let previous = database
         .current_canonical_snapshot()
         .map_err(|error| format!("无法读取身份迁移前快照：{error}"))?;
-    let migrated = build_canonical_snapshot(app)?;
+    let migrated = build_canonical_snapshot(app, database)?;
     if let Some(previous) = previous {
         let migrated_by_hash = migrated
             .skills
@@ -3729,20 +3940,20 @@ fn migrate_skill_identity_v3(app: &AppHandle, database: &Database) -> Result<(),
     fs::write(&marker, b"2\n").map_err(|error| format!("无法完成 Skill 身份迁移：{error}"))
 }
 
-fn migrate_built_in_classification_v2(app: &AppHandle, database: &Database) -> Result<(), String> {
+fn migrate_built_in_classification_v3(app: &AppHandle, database: &Database) -> Result<(), String> {
     let app_data = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法确定内置分类迁移目录：{error}"))?;
-    let marker = app_data.join(BUILT_IN_CLASSIFICATION_V2_MARKER);
+    let marker = app_data.join(BUILT_IN_CLASSIFICATION_V3_MARKER);
     if marker.is_file() {
         return Ok(());
     }
-    let snapshot = build_canonical_snapshot(app)?;
+    let snapshot = build_canonical_snapshot(app, database)?;
     database
         .replace_canonical_snapshot(&snapshot)
         .map_err(|error| format!("无法保存内置分类快照：{error}"))?;
-    fs::write(&marker, b"2\n").map_err(|error| format!("无法完成内置分类迁移：{error}"))
+    fs::write(&marker, b"3\n").map_err(|error| format!("无法完成内置分类迁移：{error}"))
 }
 
 fn canonical_skill_from_installed(skill: InstalledSkill) -> Result<CanonicalSkill, String> {
@@ -3756,8 +3967,10 @@ fn canonical_skill_from_installed(skill: InstalledSkill) -> Result<CanonicalSkil
         scope: skill.scope,
         is_built_in: skill.is_built_in,
         enabled_agents: skill.enabled_agents,
+        disabled_agents: skill.disabled_agents,
         in_library: skill.in_library,
         library_path: skill.library_path,
+        backup_suppressed: skill.backup_suppressed,
         content_hash: skill.content_hash,
         files,
     })
@@ -3891,8 +4104,10 @@ fn installed_skill_from_canonical(skill: &CanonicalSkill) -> InstalledSkill {
         scope: skill.scope.clone(),
         is_built_in: skill.is_built_in,
         enabled_agents: skill.enabled_agents.clone(),
+        disabled_agents: skill.disabled_agents.clone(),
         in_library: skill.in_library,
         library_path: skill.library_path.clone(),
+        backup_suppressed: skill.backup_suppressed,
         managed_origin: None,
         content_hash: skill.content_hash.clone(),
     }
@@ -3942,7 +4157,7 @@ fn load_or_refresh_canonical_snapshot(
     app: &AppHandle,
     database: &Database,
 ) -> Result<CanonicalSnapshot, String> {
-    get_or_build_canonical_snapshot(database, || build_canonical_snapshot(app))
+    get_or_build_canonical_snapshot(database, || build_canonical_snapshot(app, database))
 }
 
 #[tauri::command]
@@ -3950,7 +4165,7 @@ fn refresh_canonical_skills_snapshot(
     app: AppHandle,
     database: State<'_, Database>,
 ) -> Result<CanonicalSnapshot, String> {
-    let snapshot = build_canonical_snapshot(&app)?;
+    let snapshot = build_canonical_snapshot(&app, database.inner())?;
     database
         .replace_canonical_snapshot(&snapshot)
         .map_err(|error| format!("无法保存规范快照：{error}"))?;
@@ -3989,6 +4204,557 @@ fn list_agent_skills(
         &agent,
         official_documentation.to_string(),
     ))
+}
+
+fn canonical_skill<'a>(
+    snapshot: &'a CanonicalSnapshot,
+    skill_id: &str,
+) -> Result<&'a CanonicalSkill, String> {
+    snapshot
+        .skills
+        .iter()
+        .find(|skill| skill.skill_id == skill_id)
+        .ok_or_else(|| "未找到目标 Skill，请刷新列表后重试".to_string())
+}
+
+fn resolve_agent_matches(
+    skill: &CanonicalSkill,
+    candidates: Vec<InstalledSkill>,
+    action: &str,
+) -> Vec<InstalledSkill> {
+    let physical = candidates
+        .into_iter()
+        .filter(|candidate| !candidate.path.starts_with("bundled://"))
+        .collect::<Vec<_>>();
+    let mut exact = physical
+        .iter()
+        .filter(|candidate| {
+            candidate.content_hash == skill.content_hash
+                || normalized_identity_path(Path::new(&candidate.path))
+                    == normalized_identity_path(Path::new(&skill.path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    exact.sort_by(|left, right| left.path.cmp(&right.path));
+    exact.dedup_by(|left, right| {
+        normalized_identity_path(Path::new(&left.path))
+            == normalized_identity_path(Path::new(&right.path))
+    });
+    if !exact.is_empty() || action != "disable" {
+        return exact;
+    }
+
+    // Disabling is reversible and only writes a path-scoped config entry. If
+    // an older canonical snapshot has a stale hash, a unique name match lets
+    // Codex still target the real current package. Never use this fallback for
+    // uninstall, where deleting the wrong same-named directory is unacceptable.
+    let named = physical
+        .into_iter()
+        .filter(|candidate| candidate.name.eq_ignore_ascii_case(&skill.name))
+        .collect::<Vec<_>>();
+    (named.len() == 1).then_some(named).unwrap_or_default()
+}
+
+fn physical_agent_matches(
+    skill: &CanonicalSkill,
+    agent: &str,
+    action: &str,
+) -> Vec<InstalledSkill> {
+    scan_agent_skills(agent.to_string())
+        .map(|response| resolve_agent_matches(skill, response.skills, action))
+        .unwrap_or_default()
+}
+
+fn agents_for_physical_path(path: &Path) -> Vec<String> {
+    let target = normalized_identity_path(path);
+    let mut agents = ["claude-code", "cursor", "codex"]
+        .into_iter()
+        .filter(|agent| {
+            scan_agent_skills((*agent).to_string())
+                .map(|response| response.skills)
+                .unwrap_or_default()
+                .iter()
+                .filter(|candidate| !candidate.path.starts_with("bundled://"))
+                .any(|candidate| normalized_identity_path(Path::new(&candidate.path)) == target)
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    agents.sort();
+    agents.dedup();
+    agents
+}
+
+fn path_looks_like_plugin(path: &Path) -> bool {
+    normalized_identity_path(path).contains("/plugins/")
+}
+
+fn action_plan_for(
+    database: &Database,
+    skill_id: &str,
+    view_id: &str,
+    action: &str,
+) -> Result<SkillActionPlan, String> {
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "当前没有 Skills 快照".to_string())?;
+    let skill = canonical_skill(&snapshot, skill_id)?;
+    if view_id == "all" {
+        let target_paths = skill.library_path.clone().into_iter().collect::<Vec<_>>();
+        return Ok(SkillActionPlan {
+            skill_id: skill.skill_id.clone(),
+            skill_name: skill.name.clone(),
+            view_id: view_id.to_string(),
+            action: action.to_string(),
+            allowed: action == "uninstall" && !target_paths.is_empty(),
+            reason: (target_paths.is_empty()).then(|| {
+                if skill.backup_suppressed {
+                    "该 Skill 的后备副本已删除，并已停止自动备份".to_string()
+                } else {
+                    "该 Skill 当前没有 all_skills 后备副本".to_string()
+                }
+            }),
+            target_paths,
+            affected_agents: Vec::new(),
+            shared_installation: false,
+            plugin_operation: false,
+            symbolic_link_only: false,
+            keeps_library_copy: false,
+            keeps_other_agents: !skill.enabled_agents.is_empty(),
+        });
+    }
+    if !matches!(view_id, "claude-code" | "cursor" | "codex") {
+        return Err("未知 Skill 分类".to_string());
+    }
+    let matches = physical_agent_matches(skill, view_id, action);
+    let target_paths = matches
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let mut affected_agents = target_paths
+        .iter()
+        .flat_map(|path| agents_for_physical_path(Path::new(path)))
+        .collect::<Vec<_>>();
+    affected_agents.sort();
+    affected_agents.dedup();
+    let plugin_operation = target_paths
+        .iter()
+        .any(|path| path_looks_like_plugin(Path::new(path)));
+    let symbolic_link_only = !target_paths.is_empty()
+        && target_paths.iter().all(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        });
+    let unsupported_builtin = skill.is_built_in
+        && action == "disable"
+        && target_paths.is_empty()
+        && view_id != "claude-code";
+    let cursor_shared_disable = action == "disable"
+        && view_id == "cursor"
+        && affected_agents.iter().any(|agent| agent != "cursor");
+    let reason = if skill.is_built_in && action == "uninstall" {
+        Some("该内置 Skill 由 Agent 管理，不能作为普通目录单独卸载".to_string())
+    } else if unsupported_builtin {
+        Some("该内置或虚拟 Skill 没有可独立管理的安装目录".to_string())
+    } else if plugin_operation && action == "uninstall" {
+        Some("该 Skill 由插件提供；请通过 Agent 的插件管理器卸载整个插件".to_string())
+    } else if cursor_shared_disable {
+        Some("Cursor 与其他 Agent 共用此安装目录，移动目录无法只禁用 Cursor".to_string())
+    } else if target_paths.is_empty() && action == "disable" && view_id != "claude-code" {
+        Some("没有解析到该 Skill 的实体目录，无法写入 Agent 的路径级禁用配置".to_string())
+    } else if target_paths.is_empty() && action == "uninstall" {
+        Some("没有找到属于当前 Agent 的可卸载实体目录".to_string())
+    } else {
+        None
+    };
+    Ok(SkillActionPlan {
+        skill_id: skill.skill_id.clone(),
+        skill_name: skill.name.clone(),
+        view_id: view_id.to_string(),
+        action: action.to_string(),
+        allowed: reason.is_none(),
+        reason,
+        target_paths,
+        affected_agents: affected_agents.clone(),
+        shared_installation: affected_agents.len() > 1,
+        plugin_operation,
+        symbolic_link_only,
+        keeps_library_copy: skill.in_library,
+        keeps_other_agents: skill.enabled_agents.iter().any(|agent| agent != view_id),
+    })
+}
+
+#[tauri::command]
+fn prepare_skill_action(
+    database: State<'_, Database>,
+    skill_id: String,
+    view_id: String,
+    action: String,
+) -> Result<SkillActionPlan, String> {
+    action_plan_for(database.inner(), &skill_id, &view_id, &action)
+}
+
+fn remove_installation(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("无法读取卸载目标 {}：{error}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).map_err(|error| format!("移除链接 {} 失败：{error}", path.display()))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|error| format!("卸载 {} 失败：{error}", path.display()))
+    } else {
+        Err(format!("不支持的卸载目标：{}", path.display()))
+    }
+}
+
+#[tauri::command]
+fn uninstall_skill(
+    app: AppHandle,
+    database: State<'_, Database>,
+    skill_id: String,
+    view_id: String,
+) -> Result<CanonicalSnapshot, String> {
+    let plan = action_plan_for(database.inner(), &skill_id, &view_id, "uninstall")?;
+    if !plan.allowed {
+        return Err(plan
+            .reason
+            .unwrap_or_else(|| "该 Skill 不能卸载".to_string()));
+    }
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "当前没有 Skills 快照".to_string())?;
+    let skill = canonical_skill(&snapshot, &skill_id)?.clone();
+    if view_id == "all" {
+        let library = ensure_user_library(&app)?;
+        if plan
+            .target_paths
+            .iter()
+            .any(|target| !is_within(Path::new(target), &library))
+        {
+            return Err("后备副本路径已变化或不在 all_skills 中，操作已取消".to_string());
+        }
+        database
+            .suppress_skill_backup(
+                &skill.skill_id,
+                &skill.content_hash,
+                &skill.source_path,
+                unix_timestamp_i64()?,
+            )
+            .map_err(|error| format!("无法保存停止备份记录：{error}"))?;
+    }
+    for target in &plan.target_paths {
+        let path = PathBuf::from(target);
+        remove_installation(&path)?;
+        append_audit(&app, &format!("uninstall_from_{view_id}"), &path, None)?;
+    }
+    let refreshed = build_canonical_snapshot(&app, database.inner())?;
+    database
+        .replace_canonical_snapshot(&refreshed)
+        .map_err(|error| format!("无法保存卸载后的快照：{error}"))?;
+    Ok(refreshed)
+}
+
+#[tauri::command]
+fn restore_skill_backup(
+    app: AppHandle,
+    database: State<'_, Database>,
+    skill_id: String,
+) -> Result<CanonicalSnapshot, String> {
+    database
+        .clear_backup_exclusion(&skill_id)
+        .map_err(|error| format!("无法恢复自动备份：{error}"))?;
+    let refreshed = build_canonical_snapshot(&app, database.inner())?;
+    database
+        .replace_canonical_snapshot(&refreshed)
+        .map_err(|error| format!("无法保存重新备份后的快照：{error}"))?;
+    Ok(refreshed)
+}
+
+fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    }
+    let temporary = path.with_extension(format!("deadalus-{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, content).map_err(|error| format!("无法写入临时配置：{error}"))?;
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("无法原子替换配置：{error}")
+    })
+}
+
+fn set_claude_skill_override(
+    home: &Path,
+    name: &str,
+    disabled: bool,
+) -> Result<Option<serde_json::Value>, String> {
+    let path = home.join(".claude").join("settings.json");
+    let mut root = if path.is_file() {
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&path).map_err(|error| format!("无法读取 Claude Code 设置：{error}"))?,
+        )
+        .map_err(|error| format!("Claude Code 设置不是有效 JSON：{error}"))?
+    } else {
+        serde_json::json!({})
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| "Claude Code 设置根节点必须是对象".to_string())?;
+    let overrides = object
+        .entry("skillOverrides")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "Claude Code skillOverrides 必须是对象".to_string())?;
+    let previous = overrides.get(name).cloned();
+    if disabled {
+        overrides.insert(
+            name.to_string(),
+            serde_json::Value::String("off".to_string()),
+        );
+    } else {
+        overrides.remove(name);
+        if overrides.is_empty() {
+            object.remove("skillOverrides");
+        }
+    }
+    let serialized = serde_json::to_vec_pretty(&root).map_err(|error| error.to_string())?;
+    write_atomic(&path, &serialized)?;
+    Ok(previous)
+}
+
+fn codex_config_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("config.toml")
+}
+
+fn set_codex_skill_enabled(home: &Path, skill_path: &str, enabled: bool) -> Result<(), String> {
+    let path = codex_config_path(home);
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let mut document = content
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Codex config.toml 格式无效：{error}"))?;
+    if !document.contains_key("skills") {
+        document["skills"] = Item::Table(Table::new());
+    }
+    let skills = document["skills"]
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml 中 skills 必须是表".to_string())?;
+    if !skills.contains_key("config") {
+        skills.insert("config", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let entries = skills
+        .get_mut("config")
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or_else(|| "Codex config.toml 中 skills.config 必须是表数组".to_string())?;
+    let existing_index = entries
+        .iter()
+        .position(|entry| entry.get("path").and_then(Item::as_str) == Some(skill_path));
+    if let Some(existing_index) = existing_index {
+        let entry = entries
+            .get_mut(existing_index)
+            .expect("existing Codex skill config");
+        entry.insert("enabled", Item::Value(Value::from(enabled)));
+    } else {
+        let mut entry = Table::new();
+        entry.insert("path", Item::Value(Value::from(skill_path)));
+        entry.insert("enabled", Item::Value(Value::from(enabled)));
+        entries.push(entry);
+    }
+    write_atomic(&path, document.to_string().as_bytes())
+}
+
+fn cursor_disabled_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("disabled_skills").join("cursor"))
+        .map_err(|error| format!("无法确定 Cursor 停用目录：{error}"))
+}
+
+#[tauri::command]
+fn disable_skill_for_agent(
+    app: AppHandle,
+    database: State<'_, Database>,
+    skill_id: String,
+    agent: String,
+) -> Result<CanonicalSnapshot, String> {
+    let plan = action_plan_for(database.inner(), &skill_id, &agent, "disable")?;
+    if !plan.allowed {
+        return Err(plan
+            .reason
+            .unwrap_or_else(|| "该 Skill 不能按当前方式禁用".to_string()));
+    }
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "当前没有 Skills 快照".to_string())?;
+    let skill = canonical_skill(&snapshot, &skill_id)?.clone();
+    let home = user_home()?;
+    let (method, installation_path, parked_path, previous_value) = match agent.as_str() {
+        "claude-code" => {
+            let previous = set_claude_skill_override(&home, &skill.name, true)?;
+            (
+                "claude_skill_override".to_string(),
+                skill.path.clone(),
+                None,
+                previous,
+            )
+        }
+        "codex" => {
+            let target = plan
+                .target_paths
+                .first()
+                .cloned()
+                .ok_or_else(|| "没有可配置的 Codex Skill 路径".to_string())?;
+            let skill_file = PathBuf::from(&target).join("SKILL.md");
+            set_codex_skill_enabled(&home, &skill_file.to_string_lossy(), false)?;
+            ("codex_config".to_string(), target, None, None)
+        }
+        "cursor" => {
+            let target = plan
+                .target_paths
+                .first()
+                .cloned()
+                .ok_or_else(|| "没有可移动的 Cursor Skill 路径".to_string())?;
+            let source = PathBuf::from(&target);
+            let root = cursor_disabled_root(&app)?;
+            fs::create_dir_all(&root)
+                .map_err(|error| format!("无法创建 Cursor 停用目录：{error}"))?;
+            let destination = root.join(format!("{}-{}", skill.skill_id, Uuid::new_v4()));
+            fs::rename(&source, &destination)
+                .map_err(|error| format!("无法移动 Cursor Skill 到停用目录：{error}"))?;
+            (
+                "cursor_park".to_string(),
+                target,
+                Some(destination.to_string_lossy().into_owned()),
+                None,
+            )
+        }
+        _ => return Err("未知 Agent".to_string()),
+    };
+    database
+        .upsert_agent_skill_state(&AgentSkillState {
+            skill_id: skill.skill_id.clone(),
+            agent_id: agent.clone(),
+            installation_path,
+            method,
+            parked_path,
+            skill,
+            previous_value,
+            disabled_at: unix_timestamp_i64()?,
+        })
+        .map_err(|error| format!("无法保存禁用状态：{error}"))?;
+    append_audit(
+        &app,
+        &format!("disable_for_{agent}"),
+        Path::new(&skill_id),
+        None,
+    )?;
+    let refreshed = build_canonical_snapshot(&app, database.inner())?;
+    database
+        .replace_canonical_snapshot(&refreshed)
+        .map_err(|error| format!("无法保存禁用后的快照：{error}"))?;
+    Ok(refreshed)
+}
+
+#[tauri::command]
+fn enable_skill_for_agent(
+    app: AppHandle,
+    database: State<'_, Database>,
+    skill_id: String,
+    agent: String,
+) -> Result<CanonicalSnapshot, String> {
+    let state = database
+        .agent_skill_state(&skill_id, &agent)
+        .map_err(|error| format!("无法读取禁用状态：{error}"))?
+        .ok_or_else(|| "该 Skill 当前没有禁用记录".to_string())?;
+    let home = user_home()?;
+    match state.method.as_str() {
+        "claude_skill_override" => {
+            set_claude_skill_override(&home, &state.skill.name, false)?;
+            if let Some(previous) = &state.previous_value {
+                if let Some(value) = previous.as_str() {
+                    if value != "off" {
+                        let path = home.join(".claude").join("settings.json");
+                        let mut root = serde_json::from_slice::<serde_json::Value>(
+                            &fs::read(&path).map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        root.as_object_mut()
+                            .unwrap()
+                            .entry("skillOverrides")
+                            .or_insert_with(|| serde_json::json!({}))
+                            .as_object_mut()
+                            .unwrap()
+                            .insert(
+                                state.skill.name.clone(),
+                                serde_json::Value::String(value.to_string()),
+                            );
+                        write_atomic(
+                            &path,
+                            &serde_json::to_vec_pretty(&root).map_err(|error| error.to_string())?,
+                        )?;
+                    }
+                }
+            }
+        }
+        "codex_config" => {
+            let skill_file = PathBuf::from(&state.installation_path).join("SKILL.md");
+            set_codex_skill_enabled(&home, &skill_file.to_string_lossy(), true)?;
+        }
+        "cursor_park" => {
+            let parked = state
+                .parked_path
+                .as_deref()
+                .ok_or_else(|| "Cursor 停用记录缺少移动路径".to_string())?;
+            if Path::new(&state.installation_path).exists() {
+                return Err("Cursor 原安装位置已被占用，未覆盖现有内容".to_string());
+            }
+            fs::rename(parked, &state.installation_path)
+                .map_err(|error| format!("无法恢复 Cursor Skill：{error}"))?;
+        }
+        _ => return Err("未知禁用方式".to_string()),
+    }
+    database
+        .delete_agent_skill_state(&skill_id, &agent)
+        .map_err(|error| format!("无法清除禁用状态：{error}"))?;
+    append_audit(
+        &app,
+        &format!("enable_for_{agent}"),
+        Path::new(&state.installation_path),
+        None,
+    )?;
+    let refreshed = build_canonical_snapshot(&app, database.inner())?;
+    database
+        .replace_canonical_snapshot(&refreshed)
+        .map_err(|error| format!("无法保存解禁后的快照：{error}"))?;
+    Ok(refreshed)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchPreferences {
+    include_disabled_skills: bool,
+}
+
+#[tauri::command]
+fn get_search_preferences(database: State<'_, Database>) -> Result<SearchPreferences, String> {
+    Ok(SearchPreferences {
+        include_disabled_skills: database
+            .include_disabled_search()
+            .map_err(|error| format!("无法读取搜索设置：{error}"))?,
+    })
+}
+
+#[tauri::command]
+fn set_include_disabled_skills(
+    database: State<'_, Database>,
+    enabled: bool,
+) -> Result<SearchPreferences, String> {
+    database
+        .set_include_disabled_search(enabled)
+        .map_err(|error| format!("无法保存搜索设置：{error}"))?;
+    Ok(SearchPreferences {
+        include_disabled_skills: enabled,
+    })
 }
 
 fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
@@ -4088,17 +4854,6 @@ fn copy_library_skill_to_agent(
     append_audit(&app, &format!("copy_to_{agent}"), &source, Some(&target))
 }
 
-#[tauri::command]
-fn delete_library_skill(app: AppHandle, skill_path: String) -> Result<(), String> {
-    let target = PathBuf::from(skill_path);
-    let library = ensure_user_library(&app)?;
-    if !is_within(&target, &library) || !target.join("SKILL.md").is_file() {
-        return Err("只能删除用户 all_skills 库中的有效 Skill".to_string());
-    }
-    fs::remove_dir_all(&target).map_err(|error| format!("删除 Skill 失败：{error}"))?;
-    append_audit(&app, "delete_from_library", &target, None)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4118,7 +4873,7 @@ pub fn run() {
                 })?;
             let library = ensure_user_library(app.handle()).map_err(std::io::Error::other)?;
             migrate_skill_identity_v3(app.handle(), &database).map_err(std::io::Error::other)?;
-            migrate_built_in_classification_v2(app.handle(), &database)
+            migrate_built_in_classification_v3(app.handle(), &database)
                 .map_err(std::io::Error::other)?;
             let (event_sender, event_receiver) = mpsc::channel();
             let mut watcher = notify::recommended_watcher(move |result: notify::Result<_>| {
@@ -4153,6 +4908,24 @@ pub fn run() {
             watcher
                 .watch(&library, RecursiveMode::Recursive)
                 .map_err(|error| std::io::Error::other(format!("无法监听 all_skills：{error}")))?;
+            // Watch every existing user/project compatibility root as well.
+            // Optional roots may not exist yet and must not prevent startup.
+            let home = user_home().map_err(std::io::Error::other)?;
+            let mut watched_paths = HashSet::new();
+            watched_paths.insert(normalized_identity_path(&library));
+            for agent in ["claude-code", "cursor", "codex"] {
+                let (user_roots, _) =
+                    agent_configuration(agent, &home).map_err(std::io::Error::other)?;
+                for root in user_roots
+                    .into_iter()
+                    .chain(project_skill_roots(agent))
+                    .chain(managed_skill_roots(agent, &home))
+                {
+                    if root.exists() && watched_paths.insert(normalized_identity_path(&root)) {
+                        let _ = watcher.watch(&root, RecursiveMode::Recursive);
+                    }
+                }
+            }
             app.manage(LibraryWatcher {
                 _watcher: Mutex::new(watcher),
             });
@@ -4195,6 +4968,8 @@ pub fn run() {
             start_embedding_job,
             cancel_embedding_job,
             semantic_search,
+            get_search_preferences,
+            set_include_disabled_skills,
             list_skill_relations,
             get_skill_graph,
             generate_local_validation_samples,
@@ -4210,8 +4985,12 @@ pub fn run() {
             list_all_skills,
             refresh_canonical_skills_snapshot,
             get_canonical_skills_snapshot,
-            copy_library_skill_to_agent,
-            delete_library_skill
+            prepare_skill_action,
+            uninstall_skill,
+            disable_skill_for_agent,
+            enable_skill_for_agent,
+            restore_skill_backup,
+            copy_library_skill_to_agent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4244,8 +5023,10 @@ mod tests {
                 .iter()
                 .map(|agent| (*agent).to_string())
                 .collect(),
+            disabled_agents: Vec::new(),
             in_library: true,
             library_path: Some(format!("library/{name}")),
+            backup_suppressed: false,
             content_hash: format!("{name}-hash"),
             files: Vec::new(),
         }
@@ -4344,7 +5125,7 @@ mod tests {
     }
 
     #[test]
-    fn official_bundled_catalogs_are_exposed() {
+    fn virtual_bundled_catalogs_are_exposed_only_when_no_real_system_directory_exists() {
         let mut claude = Vec::new();
         add_official_bundled_skills("claude-code", &mut claude);
         assert!(claude.iter().all(|skill| skill.is_built_in));
@@ -4352,15 +5133,43 @@ mod tests {
 
         let mut codex = Vec::new();
         add_official_bundled_skills("codex", &mut codex);
-        assert!(codex.iter().all(|skill| skill.scope == "system"));
-        assert!(codex.iter().any(|skill| skill.name == "skill-creator"));
-        assert!(codex.iter().any(|skill| skill.name == "skill-installer"));
+        assert!(codex.is_empty());
 
         let mut cursor = Vec::new();
         add_official_bundled_skills("cursor", &mut cursor);
         assert_eq!(cursor.len(), 19);
         assert!(cursor.iter().all(|skill| skill.is_built_in));
         assert!(cursor.iter().any(|skill| skill.name == "review-security"));
+    }
+
+    #[test]
+    fn codex_disable_can_resolve_a_unique_current_path_from_a_stale_snapshot() {
+        let mut canonical = test_canonical_skill("skill-docs", "OpenAI Docs", &["codex"]);
+        canonical.path = "bundled://codex/openai-docs".to_string();
+        canonical.content_hash = "stale-hash".to_string();
+        canonical.is_built_in = true;
+        let mut candidate = installed_skill_from_canonical(&canonical);
+        candidate.path = "C:/Users/demo/.codex/skills/.system/openai-docs".to_string();
+        candidate.content_hash = "current-hash".to_string();
+
+        let resolved = resolve_agent_matches(&canonical, vec![candidate.clone()], "disable");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, candidate.path);
+        assert!(resolve_agent_matches(&canonical, vec![candidate], "uninstall").is_empty());
+    }
+
+    #[test]
+    fn codex_disable_rejects_ambiguous_same_named_paths() {
+        let mut canonical = test_canonical_skill("skill-docs", "OpenAI Docs", &["codex"]);
+        canonical.content_hash = "stale-hash".to_string();
+        let mut first = installed_skill_from_canonical(&canonical);
+        first.path = "C:/one/openai-docs".to_string();
+        first.content_hash = "first-hash".to_string();
+        let mut second = first.clone();
+        second.path = "C:/two/openai-docs".to_string();
+        second.content_hash = "second-hash".to_string();
+
+        assert!(resolve_agent_matches(&canonical, vec![first, second], "disable").is_empty());
     }
 
     #[test]
@@ -4448,6 +5257,59 @@ mod tests {
                 .is_built_in
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn user_skill_roots_include_legacy_and_cross_agent_compatibility_locations() {
+        let home = PathBuf::from("C:/Users/test");
+        let (codex, _) = agent_configuration("codex", &home).unwrap();
+        assert_eq!(
+            codex,
+            vec![
+                home.join(".agents").join("skills"),
+                home.join(".codex").join("skills"),
+            ]
+        );
+
+        let (cursor, _) = agent_configuration("cursor", &home).unwrap();
+        assert!(cursor.contains(&home.join(".cursor").join("skills")));
+        assert!(cursor.contains(&home.join(".agents").join("skills")));
+        assert!(cursor.contains(&home.join(".claude").join("skills")));
+        assert!(cursor.contains(&home.join(".codex").join("skills")));
+
+        let (claude, _) = agent_configuration("claude-code", &home).unwrap();
+        assert_eq!(claude, vec![home.join(".claude").join("skills")]);
+    }
+
+    #[test]
+    fn project_roots_follow_agent_official_and_compatibility_conventions() {
+        let root = temporary_directory("project-skill-roots");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("apps").join("desktop");
+        fs::create_dir_all(&nested).unwrap();
+
+        let codex = project_skill_roots_from("codex", &nested);
+        assert!(codex.contains(&root.join(".agents").join("skills")));
+        assert!(!codex.contains(&root.join(".codex").join("skills")));
+
+        let claude = project_skill_roots_from("claude-code", &nested);
+        assert!(claude.contains(&root.join(".claude").join("skills")));
+
+        let cursor = project_skill_roots_from("cursor", &nested);
+        for agent_directory in [".agents", ".cursor", ".claude", ".codex"] {
+            assert!(cursor.contains(&root.join(agent_directory).join("skills")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_system_root_is_distinct_from_similarly_prefixed_directories() {
+        let root = PathBuf::from("C:/Users/test/.codex/skills/.system");
+        assert!(normalized_path_is_within(&root.join("openai-docs"), &root));
+        assert!(!normalized_path_is_within(
+            &PathBuf::from("C:/Users/test/.codex/skills/.system-copy/example"),
+            &root
+        ));
     }
 
     #[test]
@@ -5257,5 +6119,58 @@ mod tests {
             &home
         ));
         fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn claude_override_preserves_unrelated_user_settings() {
+        let root = temporary_directory("claude-disable-config");
+        let settings = root.join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            r#"{"theme":"dark","skillOverrides":{"other":"on"}}"#,
+        )
+        .unwrap();
+        let previous = set_claude_skill_override(&root, "demo", true).unwrap();
+        assert!(previous.is_none());
+        let disabled: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(disabled["theme"], "dark");
+        assert_eq!(disabled["skillOverrides"]["other"], "on");
+        assert_eq!(disabled["skillOverrides"]["demo"], "off");
+        set_claude_skill_override(&root, "demo", false).unwrap();
+        let enabled: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        assert!(enabled["skillOverrides"].get("demo").is_none());
+        assert_eq!(enabled["skillOverrides"]["other"], "on");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_skill_toggle_updates_one_entry_without_overwriting_config() {
+        let root = temporary_directory("codex-disable-config");
+        let config = root.join(".codex").join("config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            "model = \"test-model\"\n\n[[skills.config]]\npath = \"C:/other/SKILL.md\"\nenabled = false\n",
+        )
+        .unwrap();
+        set_codex_skill_enabled(&root, "C:/demo/SKILL.md", false).unwrap();
+        set_codex_skill_enabled(&root, "C:/demo/SKILL.md", true).unwrap();
+        let document = fs::read_to_string(&config)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(document["model"].as_str(), Some("test-model"));
+        let entries = document["skills"]["config"].as_array_of_tables().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get(0).unwrap()["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            entries.get(1).unwrap()["path"].as_str(),
+            Some("C:/demo/SKILL.md")
+        );
+        assert_eq!(entries.get(1).unwrap()["enabled"].as_bool(), Some(true));
+        fs::remove_dir_all(root).unwrap();
     }
 }

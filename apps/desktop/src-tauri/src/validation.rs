@@ -706,8 +706,10 @@ mod tests {
                 scope: "user".to_string(),
                 is_built_in: false,
                 enabled_agents: vec!["cursor".to_string()],
+                disabled_agents: vec![],
                 in_library: true,
                 library_path: None,
+                backup_suppressed: false,
                 content_hash: "skill-content".to_string(),
                 files: vec![CanonicalFile {
                     file_id: "skill-file".to_string(),

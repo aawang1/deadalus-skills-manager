@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 type RawProfile = (
     String,
@@ -2272,6 +2272,186 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn include_disabled_search(&self) -> DatabaseResult<bool> {
+        self.connection()?
+            .query_row(
+                "SELECT include_disabled_search FROM index_settings WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_include_disabled_search(&self, enabled: bool) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            "UPDATE index_settings SET include_disabled_search = ?1 WHERE singleton_id = 1",
+            [enabled],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_agent_skill_state(&self, state: &AgentSkillState) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO agent_skill_states (
+                skill_id, agent_id, installation_path, method, parked_path,
+                skill_json, previous_value_json, disabled_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(skill_id, agent_id) DO UPDATE SET
+                installation_path = excluded.installation_path,
+                method = excluded.method,
+                parked_path = excluded.parked_path,
+                skill_json = excluded.skill_json,
+                previous_value_json = excluded.previous_value_json,
+                disabled_at = excluded.disabled_at
+            "#,
+            params![
+                state.skill_id,
+                state.agent_id,
+                state.installation_path,
+                state.method,
+                state.parked_path,
+                serde_json::to_string(&state.skill)?,
+                state
+                    .previous_value
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                state.disabled_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_skill_states(&self) -> DatabaseResult<Vec<AgentSkillState>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT skill_id, agent_id, installation_path, method, parked_path,
+                   skill_json, previous_value_json, disabled_at
+            FROM agent_skill_states
+            ORDER BY agent_id, skill_id
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let skill_json: String = row.get(5)?;
+                let previous_json: Option<String> = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    skill_json,
+                    previous_json,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    skill_id,
+                    agent_id,
+                    installation_path,
+                    method,
+                    parked_path,
+                    skill,
+                    previous,
+                    disabled_at,
+                ) = row?;
+                Ok(AgentSkillState {
+                    skill_id,
+                    agent_id,
+                    installation_path,
+                    method,
+                    parked_path,
+                    skill: serde_json::from_str(&skill)?,
+                    previous_value: previous
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                    disabled_at,
+                })
+            })
+            .collect();
+        rows
+    }
+
+    pub fn agent_skill_state(
+        &self,
+        skill_id: &str,
+        agent_id: &str,
+    ) -> DatabaseResult<Option<AgentSkillState>> {
+        Ok(self
+            .agent_skill_states()?
+            .into_iter()
+            .find(|state| state.skill_id == skill_id && state.agent_id == agent_id))
+    }
+
+    pub fn delete_agent_skill_state(&self, skill_id: &str, agent_id: &str) -> DatabaseResult<bool> {
+        Ok(self.connection()?.execute(
+            "DELETE FROM agent_skill_states WHERE skill_id = ?1 AND agent_id = ?2",
+            params![skill_id, agent_id],
+        )? > 0)
+    }
+
+    pub fn suppress_skill_backup(
+        &self,
+        skill_id: &str,
+        content_hash: &str,
+        source_path: &str,
+        excluded_at: i64,
+    ) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO skill_backup_exclusions (
+                skill_id, content_hash, source_path, missing_seen, excluded_at
+            ) VALUES (?1, ?2, ?3, 0, ?4)
+            ON CONFLICT(skill_id) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                source_path = excluded.source_path,
+                missing_seen = 0,
+                excluded_at = excluded.excluded_at
+            "#,
+            params![skill_id, content_hash, source_path, excluded_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn backup_exclusions(&self) -> DatabaseResult<Vec<SkillBackupExclusion>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT skill_id, content_hash, source_path, missing_seen, excluded_at FROM skill_backup_exclusions ORDER BY skill_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SkillBackupExclusion {
+                    skill_id: row.get(0)?,
+                    content_hash: row.get(1)?,
+                    source_path: row.get(2)?,
+                    missing_seen: row.get(3)?,
+                    excluded_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        rows
+    }
+
+    pub fn mark_backup_exclusion_missing(&self, skill_id: &str) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            "UPDATE skill_backup_exclusions SET missing_seen = 1 WHERE skill_id = ?1",
+            [skill_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_backup_exclusion(&self, skill_id: &str) -> DatabaseResult<bool> {
+        Ok(self.connection()?.execute(
+            "DELETE FROM skill_backup_exclusions WHERE skill_id = ?1",
+            [skill_id],
+        )? > 0)
+    }
+
     pub fn index_sync_status(
         &self,
         active_profile_id: Option<&str>,
@@ -2335,9 +2515,9 @@ impl Database {
                 INSERT INTO canonical_skills (
                     snapshot_id, skill_id, canonical_path, name, description,
                     content_hash, source_path, scope, is_built_in, in_library,
-                    library_path, deleted_at
+                    library_path, disabled_agents_json, backup_suppressed, deleted_at
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL
                 )
                 "#,
                 params![
@@ -2352,6 +2532,8 @@ impl Database {
                     skill.is_built_in,
                     skill.in_library,
                     skill.library_path,
+                    serde_json::to_string(&skill.disabled_agents)?,
+                    skill.backup_suppressed,
                 ],
             )?;
             for agent in &skill.enabled_agents {
@@ -2448,7 +2630,8 @@ impl Database {
         let mut skill_statement = connection.prepare(
             r#"
             SELECT skill_id, name, description, canonical_path, source_path, scope,
-                   is_built_in, in_library, library_path, content_hash
+                   is_built_in, in_library, library_path, content_hash,
+                   disabled_agents_json, backup_suppressed
             FROM canonical_skills
             WHERE snapshot_id = ?1 AND deleted_at IS NULL
             ORDER BY lower(name), content_hash, skill_id
@@ -2467,6 +2650,9 @@ impl Database {
                 in_library: row.get(7)?,
                 library_path: row.get(8)?,
                 content_hash: row.get(9)?,
+                disabled_agents: serde_json::from_str(&row.get::<_, String>(10)?)
+                    .unwrap_or_default(),
+                backup_suppressed: row.get(11)?,
                 files: Vec::new(),
             })
         })?;
@@ -2652,10 +2838,37 @@ pub struct CanonicalSkill {
     pub scope: String,
     pub is_built_in: bool,
     pub enabled_agents: Vec<String>,
+    #[serde(default)]
+    pub disabled_agents: Vec<String>,
     pub in_library: bool,
     pub library_path: Option<String>,
+    #[serde(default)]
+    pub backup_suppressed: bool,
     pub content_hash: String,
     pub files: Vec<CanonicalFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSkillState {
+    pub skill_id: String,
+    pub agent_id: String,
+    pub installation_path: String,
+    pub method: String,
+    pub parked_path: Option<String>,
+    pub skill: CanonicalSkill,
+    pub previous_value: Option<serde_json::Value>,
+    pub disabled_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillBackupExclusion {
+    pub skill_id: String,
+    pub content_hash: String,
+    pub source_path: String,
+    pub missing_seen: bool,
+    pub excluded_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2700,6 +2913,9 @@ fn migrate(connection: &mut Connection) -> DatabaseResult<()> {
     }
     if version < 5 {
         migration_v5(connection.transaction()?)?;
+    }
+    if version < 6 {
+        migration_v6(connection.transaction()?)?;
     }
     let final_version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -3184,6 +3400,45 @@ fn migration_v5(transaction: Transaction<'_>) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn migration_v6(transaction: Transaction<'_>) -> DatabaseResult<()> {
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE canonical_skills ADD COLUMN disabled_agents_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE canonical_skills ADD COLUMN backup_suppressed INTEGER NOT NULL DEFAULT 0
+            CHECK (backup_suppressed IN (0, 1));
+        ALTER TABLE index_settings ADD COLUMN include_disabled_search INTEGER NOT NULL DEFAULT 0
+            CHECK (include_disabled_search IN (0, 1));
+
+        CREATE TABLE agent_skill_states (
+            skill_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            installation_path TEXT NOT NULL,
+            method TEXT NOT NULL,
+            parked_path TEXT,
+            skill_json TEXT NOT NULL,
+            previous_value_json TEXT,
+            disabled_at INTEGER NOT NULL,
+            PRIMARY KEY(skill_id, agent_id)
+        );
+
+        CREATE TABLE skill_backup_exclusions (
+            skill_id TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            missing_seen INTEGER NOT NULL DEFAULT 0 CHECK (missing_seen IN (0, 1)),
+            excluded_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX agent_skill_states_agent_idx
+            ON agent_skill_states(agent_id, skill_id);
+
+        INSERT INTO schema_version(version, applied_at) VALUES (6, unixepoch());
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn profile_from_raw(raw: RawProfile) -> DatabaseResult<EmbeddingProfile> {
     Ok(EmbeddingProfile {
         profile_id: raw.0,
@@ -3390,8 +3645,10 @@ mod tests {
                 scope: "user".to_string(),
                 is_built_in: false,
                 enabled_agents: vec!["claude-code".to_string(), "cursor".to_string()],
+                disabled_agents: vec![],
                 in_library: true,
                 library_path: Some(format!("library/{name}")),
+                backup_suppressed: false,
                 content_hash: "skill-content".to_string(),
                 files: vec![CanonicalFile {
                     file_id: "file-stable".to_string(),
@@ -3536,6 +3793,48 @@ mod tests {
                 .unwrap()
                 .ignore_built_in_skills
         );
+    }
+
+    #[test]
+    fn disabled_skill_state_backup_exclusion_and_search_preference_round_trip() {
+        let database = Database::in_memory().unwrap();
+        let skill = canonical_snapshot("snapshot-state", "stateful")
+            .skills
+            .remove(0);
+        let state = AgentSkillState {
+            skill_id: skill.skill_id.clone(),
+            agent_id: "cursor".to_string(),
+            installation_path: "C:/skills/stateful".to_string(),
+            method: "cursor_park".to_string(),
+            parked_path: Some("C:/disabled/stateful".to_string()),
+            skill: skill.clone(),
+            previous_value: None,
+            disabled_at: 12,
+        };
+        database.upsert_agent_skill_state(&state).unwrap();
+        assert_eq!(
+            database
+                .agent_skill_state(&skill.skill_id, "cursor")
+                .unwrap(),
+            Some(state)
+        );
+        assert!(!database.include_disabled_search().unwrap());
+        database.set_include_disabled_search(true).unwrap();
+        assert!(database.include_disabled_search().unwrap());
+
+        database
+            .suppress_skill_backup(&skill.skill_id, &skill.content_hash, &skill.source_path, 13)
+            .unwrap();
+        let exclusion = database.backup_exclusions().unwrap().remove(0);
+        assert!(!exclusion.missing_seen);
+        database
+            .mark_backup_exclusion_missing(&skill.skill_id)
+            .unwrap();
+        assert!(database.backup_exclusions().unwrap()[0].missing_seen);
+        assert!(database.clear_backup_exclusion(&skill.skill_id).unwrap());
+        assert!(database
+            .delete_agent_skill_state(&skill.skill_id, "cursor")
+            .unwrap());
     }
 
     #[test]

@@ -32,6 +32,8 @@ export function EmbeddingProfilesPanel({
   const [defaults, setDefaults] = useState<EmbeddingProfileDefaults>();
   const [form, setForm] = useState<CreateEmbeddingProfileRequest>();
   const [busy, setBusy] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<EmbeddingProfile>();
+  const [deleteError, setDeleteError] = useState("");
 
   useEffect(() => {
     if (!isNative || !activeCredential) {
@@ -54,6 +56,18 @@ export function EmbeddingProfilesPanel({
       current = false;
     };
   }, [activeCredential?.id, activeCredential?.provider, isNative]);
+
+  useEffect(() => {
+    if (!pendingDelete) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) {
+        setPendingDelete(undefined);
+        setDeleteError("");
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [busy, pendingDelete]);
 
   const createProfile = async (event: FormEvent) => {
     event.preventDefault();
@@ -129,20 +143,36 @@ export function EmbeddingProfilesPanel({
     }
   };
 
-  const deleteProfile = async (profile: EmbeddingProfile) => {
-    if (!isNative || profile.isActive) return;
-    if (!window.confirm(`确定删除 Profile ${profile.model}？其索引、向量、Jobs 与本地验证数据将一并删除。`)) {
-      return;
-    }
+  const requestDeleteProfile = (profile: EmbeddingProfile) => {
+    if (!isNative || busy || profile.isActive) return;
+    setDeleteError("");
+    setPendingDelete(profile);
+  };
+
+  const closeDeleteProfile = () => {
+    if (busy) return;
+    setPendingDelete(undefined);
+    setDeleteError("");
+  };
+
+  const confirmDeleteProfile = async () => {
+    if (!isNative || !pendingDelete || busy) return;
+    const profile = pendingDelete;
     setBusy(true);
+    setDeleteError("");
     try {
       const deleted = await api.deleteEmbeddingProfile(profile.profileId);
-      if (deleted) {
-        setProfiles(profiles.filter((item) => item.profileId !== profile.profileId));
-        notify("success", "Embedding Profile 已删除。");
+      if (!deleted) {
+        setDeleteError("该 Profile 已不存在。请关闭弹窗并刷新列表。");
+        return;
       }
+      setProfiles(profiles.filter((item) => item.profileId !== profile.profileId));
+      setPendingDelete(undefined);
+      notify("success", "Embedding Profile 已删除。");
     } catch (error) {
-      notify("error", String(error));
+      const message = String(error);
+      setDeleteError(message);
+      notify("error", message);
     } finally {
       setBusy(false);
     }
@@ -246,7 +276,7 @@ export function EmbeddingProfilesPanel({
                     aria-label={`删除 ${profile.model} Profile`}
                     title={profile.isActive ? "活动 Profile 不能删除" : "删除 Profile"}
                     disabled={!isNative || busy || profile.isActive}
-                    onClick={() => deleteProfile(profile)}
+                    onClick={() => requestDeleteProfile(profile)}
                   >
                     ×
                   </button>
@@ -280,6 +310,62 @@ export function EmbeddingProfilesPanel({
           ))}
         </div>
       </section>
+
+      {pendingDelete && (
+        <div
+          className="nested-modal-backdrop"
+          role="presentation"
+          onMouseDown={closeDeleteProfile}
+        >
+          <section
+            className="profile-delete-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="profile-delete-title"
+            aria-describedby="profile-delete-description"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <p className="eyebrow">DESTRUCTIVE ACTION</p>
+                <h3 id="profile-delete-title">确认删除 Embedding Profile</h3>
+              </div>
+              <button
+                className="close-button"
+                type="button"
+                aria-label="关闭删除确认"
+                disabled={busy}
+                onClick={closeDeleteProfile}
+              >
+                ×
+              </button>
+            </header>
+            <strong>{pendingDelete.model}</strong>
+            <code>{pendingDelete.profileId}</code>
+            <p id="profile-delete-description">
+              删除后，该 Profile 的索引、向量、Jobs、自适应参数与本地验证数据将一并清除。此操作无法撤销。
+            </p>
+            {deleteError && (
+              <p className="profile-delete-modal__error" role="alert">
+                {deleteError}
+              </p>
+            )}
+            <footer>
+              <button type="button" disabled={busy} onClick={closeDeleteProfile} autoFocus>
+                取消
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                disabled={busy}
+                onClick={confirmDeleteProfile}
+              >
+                {busy ? "删除中…" : "确认删除"}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

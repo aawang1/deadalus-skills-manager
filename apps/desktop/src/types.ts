@@ -34,8 +34,30 @@ export interface InstalledSkill {
   scope: "user" | "system";
   isBuiltIn: boolean;
   enabledAgents: AgentId[];
+  disabledAgents: AgentId[];
   inLibrary: boolean;
   libraryPath?: string;
+  backupSuppressed: boolean;
+}
+
+export interface SkillActionPlan {
+  skillId: string;
+  skillName: string;
+  viewId: ViewId;
+  action: "uninstall" | "disable";
+  allowed: boolean;
+  reason?: string;
+  targetPaths: string[];
+  affectedAgents: AgentId[];
+  sharedInstallation: boolean;
+  pluginOperation: boolean;
+  symbolicLinkOnly: boolean;
+  keepsLibraryCopy: boolean;
+  keepsOtherAgents: boolean;
+}
+
+export interface SearchPreferences {
+  includeDisabledSkills: boolean;
 }
 
 export interface AgentSkillsResponse {
@@ -305,6 +327,7 @@ export interface SkillGraphNode {
   clusterId?: string;
   centrality: number;
   superseded: boolean;
+  disabled: boolean;
 }
 
 export interface SkillGraphCluster {

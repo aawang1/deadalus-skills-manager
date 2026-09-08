@@ -11,9 +11,9 @@ const graph: SkillGraphSnapshot = {
   excludedUnconnectedCount: 0,
   clusters: [{ clusterId: "cluster-a", name: "开发", summary: "开发能力", memberSkillIds: ["a", "b"], coreSkillIds: ["a", "b"], peripheral: false }],
   nodes: [
-    { skillId: "a", name: "A", path: "C:/a", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.94, superseded: false },
-    { skillId: "b", name: "B", path: "C:/b", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.9, superseded: false },
-    { skillId: "c", name: "C", path: "C:/c", enabledAgents: ["cursor"], centrality: 0, superseded: false },
+    { skillId: "a", name: "A", path: "C:/a", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.94, superseded: false, disabled: false },
+    { skillId: "b", name: "B", path: "C:/b", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.9, superseded: false, disabled: false },
+    { skillId: "c", name: "C", path: "C:/c", enabledAgents: ["cursor"], centrality: 0, superseded: false, disabled: false },
   ],
   edges: [{ edgeId: "a-b", sourceSkillId: "a", targetSkillId: "b", similarity: 0.92, nearestFallback: false, relations: [{ relationshipType: "similar_to", vectorType: "overall_function", state: "over_threshold", source: "vector_similarity", evidence: {} }] }],
   proximities: [],

@@ -517,7 +517,66 @@ select {
 .skill-item__title {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 0.4rem;
+}
+
+.skill-item__identity,
+.skill-item__quick-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.skill-item__identity {
+  flex-wrap: wrap;
+}
+
+.skill-item__quick-actions {
+  flex: 0 0 auto;
+}
+
+.skill-quick-action {
+  display: grid;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 0.35rem;
+  background: transparent;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.skill-quick-action:hover:not(:disabled),
+.skill-quick-action:focus-visible {
+  opacity: 1;
+  outline: 2px solid rgba(255, 255, 255, 0.13);
+  outline-offset: 1px;
+}
+
+.skill-quick-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.2;
+}
+
+.skill-quick-action--uninstall { color: #ff6f78; }
+.skill-quick-action--disable { color: #e7b94d; }
+.skill-quick-action--enable,
+.skill-quick-action--restore { color: #64cf91; }
+
+.skill-item--disabled {
+  opacity: 0.34;
+}
+
+.skill-item--disabled:hover,
+.skill-item--disabled:focus-within {
+  opacity: 0.62;
 }
 
 .skill-item .skill-item__badge {
@@ -533,6 +592,12 @@ select {
   font-size: 0.5rem;
   line-height: 1.2;
   white-space: nowrap;
+}
+
+.skill-item .skill-item__badge--disabled {
+  border-color: rgba(231, 185, 77, 0.32);
+  color: #e7c979;
+  background: rgba(231, 185, 77, 0.08);
 }
 
 .skill-item span,
@@ -818,6 +883,20 @@ select {
 .skill-graph__node.is-superseded:hover,
 .skill-graph__node.is-superseded:focus-visible {
   opacity: 0.9;
+}
+
+.skill-graph__node.is-disabled {
+  opacity: 0.2;
+}
+
+.skill-graph__node.is-disabled .skill-graph__node-motion,
+.skill-graph__node.is-disabled .skill-graph__node-halo {
+  animation: none;
+}
+
+.skill-graph__node.is-disabled .skill-graph__node-dot {
+  fill: #17191d;
+  stroke: rgba(190, 195, 205, 0.38);
 }
 
 .skill-graph__node:active {
@@ -2422,7 +2501,8 @@ a:focus-visible {
 }
 
 .profile-switch-modal,
-.preflight-modal {
+.preflight-modal,
+.profile-delete-modal {
   position: relative;
   width: min(92vw, 30rem);
   padding: 1.25rem;
@@ -2433,6 +2513,92 @@ a:focus-visible {
     var(--color-surface);
   box-shadow: 0 1.5rem 5rem rgba(0, 0, 0, 0.72);
   animation: dialog-in 160ms ease-out;
+}
+
+.profile-delete-modal {
+  width: min(92vw, 28rem);
+  border-color: rgba(255, 91, 101, 0.42);
+  background:
+    radial-gradient(circle at 90% -15%, rgba(255, 91, 101, 0.12), transparent 45%),
+    var(--color-surface);
+}
+
+.profile-delete-modal > header,
+.profile-delete-modal > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.profile-delete-modal > header {
+  padding-bottom: 0.8rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.profile-delete-modal h3 {
+  margin: 0.2rem 0 0;
+  color: #ffb1b6;
+  font-size: 0.85rem;
+}
+
+.profile-delete-modal > strong,
+.profile-delete-modal > code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.profile-delete-modal > strong {
+  margin-top: 0.9rem;
+  color: var(--color-text);
+  font-size: 0.75rem;
+}
+
+.profile-delete-modal > code {
+  margin-top: 0.25rem;
+  color: var(--color-text-faint);
+  font-size: 0.58rem;
+}
+
+.profile-delete-modal > p {
+  margin: 0.85rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.67rem;
+  line-height: 1.65;
+}
+
+.profile-delete-modal .profile-delete-modal__error {
+  padding: 0.65rem 0.75rem;
+  border-left: 3px solid #ff5b65;
+  color: #ffdadd;
+  background: rgba(255, 91, 101, 0.075);
+}
+
+.profile-delete-modal > footer {
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+.profile-delete-modal > footer button {
+  min-height: 2.25rem;
+  padding: 0 0.8rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.45rem;
+  color: var(--color-text-muted);
+  background: transparent;
+  font-size: 0.62rem;
+  cursor: pointer;
+}
+
+.profile-delete-modal > footer button:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
+.profile-delete-modal > footer .danger-button {
+  border-color: rgba(255, 91, 101, 0.55);
+  color: #ffe7e9;
+  background: #a72f39;
 }
 
 .modal-close {
@@ -2681,6 +2847,162 @@ a:focus-visible {
 .semantic-search-form button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.semantic-disabled-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.55rem;
+  color: var(--color-text-muted);
+  font-size: 0.58rem;
+  cursor: pointer;
+}
+
+.semantic-disabled-toggle input {
+  accent-color: #d9aa3e;
+}
+
+.disabled-badge {
+  padding: 0.12rem 0.32rem;
+  border: 1px solid rgba(231, 185, 77, 0.35);
+  border-radius: 999px;
+  color: #e7c979;
+  background: rgba(231, 185, 77, 0.08);
+  font-size: 0.5rem;
+}
+
+.skill-action-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: grid;
+  padding: 1.25rem;
+  place-items: center;
+  background: rgba(2, 3, 5, 0.76);
+  backdrop-filter: blur(5px);
+}
+
+.skill-action-dialog {
+  width: min(32rem, 92vw);
+  max-height: min(38rem, 88vh);
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.85rem;
+  color: var(--color-text-muted);
+  background: #090c11;
+  box-shadow: 0 1.5rem 5rem rgba(0, 0, 0, 0.58);
+  animation: dialog-in 160ms ease-out;
+}
+
+.skill-action-dialog > header,
+.skill-action-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.skill-action-dialog h3 {
+  margin: 0.15rem 0 0;
+  color: var(--color-text);
+  font-size: 0.92rem;
+}
+
+.skill-action-dialog > strong {
+  display: block;
+  margin-top: 1rem;
+  color: var(--color-text);
+  font-size: 0.78rem;
+}
+
+.skill-action-dialog > p,
+.skill-action-dialog__impact,
+.skill-action-dialog__note,
+.skill-action-dialog__state {
+  font-size: 0.64rem;
+  line-height: 1.55;
+}
+
+.skill-action-dialog__impact,
+.skill-action-dialog__note {
+  margin-top: 0.65rem;
+  padding: 0.65rem 0.7rem;
+  border-left: 2px solid #e7b94d;
+  background: rgba(231, 185, 77, 0.07);
+}
+
+.skill-action-dialog__note {
+  border-left-color: #5e9cf7;
+  background: rgba(57, 132, 255, 0.07);
+}
+
+.skill-action-dialog__error {
+  color: #ff8b92;
+}
+
+.skill-action-dialog details {
+  margin-top: 0.7rem;
+  font-size: 0.58rem;
+}
+
+.skill-action-dialog details code {
+  display: block;
+  margin-top: 0.35rem;
+  overflow-wrap: anywhere;
+  color: var(--color-text-faint);
+}
+
+.skill-action-dialog > footer {
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+.skill-action-dialog > footer button {
+  min-height: 2rem;
+  padding: 0 0.75rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.45rem;
+  color: var(--color-text-muted);
+  background: transparent;
+  font-size: 0.62rem;
+  cursor: pointer;
+}
+
+.skill-action-dialog .danger-button {
+  border-color: rgba(255, 91, 101, 0.55);
+  color: #ffe7e9;
+  background: #a72f39;
+}
+
+.skill-action-dialog .warning-button {
+  border-color: rgba(231, 185, 77, 0.5);
+  color: #f4d98d;
+  background: rgba(231, 185, 77, 0.08);
+}
+
+.copy-failure-dialog {
+  border-color: rgba(255, 91, 101, 0.42);
+  box-shadow:
+    0 1.5rem 5rem rgba(0, 0, 0, 0.58),
+    inset 0 1px 0 rgba(255, 115, 124, 0.08);
+}
+
+.copy-failure-dialog .eyebrow,
+.copy-failure-dialog h3 {
+  color: #ff8b92;
+}
+
+.copy-failure-dialog__reason {
+  border-left-color: #ff5b65;
+  color: #ffdadd;
+  background: rgba(255, 91, 101, 0.075);
+  overflow-wrap: anywhere;
+}
+
+.copy-failure-dialog__hint {
+  color: var(--color-text-faint);
 }
 
 .semantic-state {

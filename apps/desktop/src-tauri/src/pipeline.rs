@@ -25,6 +25,7 @@ const OPENAI_EMBEDDING_BATCH_SIZE: usize = 64;
 // DashScope compatible-mode rejects larger input arrays for text-embedding-v4.
 // Keep a conservative provider-specific limit instead of sharing OpenAI's batch size.
 const QWEN_EMBEDDING_BATCH_SIZE: usize = 10;
+const QWEN_MAX_INPUT_CHARS: usize = 33_000;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
@@ -413,6 +414,16 @@ impl<T: JsonTransport> EmbeddingProvider for RemoteEmbeddingProvider<T> {
                 vectors: Vec::new(),
                 token_count: Some(0),
             });
+        }
+        if self.provider == "qwen" {
+            for input in inputs {
+                let length = input.chars().count();
+                if !(1..=QWEN_MAX_INPUT_CHARS).contains(&length) {
+                    return Err(ProviderError::Rejected(format!(
+                        "Qwen input length {length} is outside the supported range 1..={QWEN_MAX_INPUT_CHARS}"
+                    )));
+                }
+            }
         }
         let mut vectors = Vec::with_capacity(inputs.len());
         let mut token_count = 0u64;
@@ -1076,6 +1087,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qwen_rejects_oversized_input_before_transport() {
+        let mut qwen_profile = profile(2);
+        qwen_profile.provider = "qwen".to_string();
+        let provider = RemoteEmbeddingProvider::new(
+            &qwen_profile,
+            "not-a-real-key".to_string(),
+            MockTransport {
+                calls: AtomicUsize::new(0),
+                responses: Mutex::new(Vec::new()),
+            },
+        );
+        let error = provider
+            .embed(&["a".repeat(QWEN_MAX_INPUT_CHARS + 1)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Rejected(_)));
+        assert_eq!(provider.transport.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn embedding_batches_retry_and_validate_dimensions() {
         let transport = MockTransport {
             calls: AtomicUsize::new(0),
@@ -1188,8 +1219,10 @@ mod tests {
             scope: "user".to_string(),
             is_built_in: false,
             enabled_agents: vec![],
+            disabled_agents: vec![],
             in_library: true,
             library_path: None,
+            backup_suppressed: false,
             content_hash: "hash".to_string(),
             files: [
                 ("SKILL.md", 64, true),
@@ -1248,8 +1281,10 @@ mod tests {
                 scope: "user".to_string(),
                 is_built_in: false,
                 enabled_agents: vec![],
+                disabled_agents: vec![],
                 in_library: true,
                 library_path: None,
+                backup_suppressed: false,
                 content_hash: "hash".to_string(),
                 files: vec![CanonicalFile {
                     file_id: "file".to_string(),
