@@ -847,6 +847,15 @@ select {
   animation: skill-cluster-breathe 6.4s ease-in-out infinite alternate;
 }
 
+.skill-graph__cluster.is-semantic-stale .skill-graph__cluster-center circle {
+  fill: #251012;
+  stroke: rgba(255, 95, 103, 0.92);
+}
+
+.skill-graph__cluster.is-semantic-stale .skill-graph__cluster-center text {
+  fill: #ffb8bc;
+}
+
 .skill-graph__cluster-center text {
   fill: #bed5f7;
   font-family: "Cascadia Code", Consolas, monospace;
@@ -897,6 +906,20 @@ select {
 .skill-graph__node.is-disabled .skill-graph__node-dot {
   fill: #17191d;
   stroke: rgba(190, 195, 205, 0.38);
+}
+
+.skill-graph__node.is-classification-stale:not(.is-disabled) .skill-graph__node-dot {
+  fill: #281012;
+  stroke: rgba(255, 84, 94, 0.94);
+}
+
+.skill-graph__node.is-classification-stale:not(.is-disabled) .skill-graph__node-halo {
+  fill: rgba(255, 70, 82, 0.08);
+  stroke: rgba(255, 84, 94, 0.3);
+}
+
+.skill-graph__node.is-classification-stale:not(.is-disabled) text {
+  fill: #ff9fa6;
 }
 
 .skill-graph__node:active {

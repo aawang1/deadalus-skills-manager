@@ -5,7 +5,8 @@ use crate::vectorization::{
 use crate::{
     adaptive::{AdaptivePolicyState, AdaptiveSignals},
     application::{
-        AnalysisComparison, ConflictResolutionResult, LlmAnalysisResult, RuleAnalysisResult,
+        AnalysisComparison, ClusterSemantic, ConflictResolutionResult, LlmAnalysisResult,
+        RuleAnalysisResult, SemanticRecordStatus, SkillClassification,
     },
     pipeline::{IndexDiff, IndexSyncStatus},
     validation::SavedAnalysisRecord,
@@ -18,7 +19,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 type RawProfile = (
     String,
@@ -1759,6 +1760,300 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn skill_classification(
+        &self,
+        profile_id: &str,
+        skill_id: &str,
+    ) -> DatabaseResult<Option<SkillClassification>> {
+        self.connection()?
+            .query_row(
+                "SELECT record_json FROM skill_classifications WHERE profile_id = ?1 AND skill_id = ?2",
+                params![profile_id, skill_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn classifications_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> DatabaseResult<Vec<SkillClassification>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT record_json FROM skill_classifications WHERE profile_id = ?1 ORDER BY skill_id",
+        )?;
+        let rows = statement.query_map([profile_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let value = row?;
+            serde_json::from_str(&value).map_err(Into::into)
+        })
+        .collect()
+    }
+
+    pub fn save_skill_classification(
+        &self,
+        classification: &SkillClassification,
+    ) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO skill_classifications (
+                profile_id, skill_id, input_hash, schema_version, provider, model,
+                prompt_version, broad_category, status, error, record_json,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(profile_id, skill_id) DO UPDATE SET
+                input_hash = excluded.input_hash,
+                schema_version = excluded.schema_version,
+                provider = excluded.provider,
+                model = excluded.model,
+                prompt_version = excluded.prompt_version,
+                broad_category = excluded.broad_category,
+                status = excluded.status,
+                error = excluded.error,
+                record_json = excluded.record_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                classification.profile_id,
+                classification.skill_id,
+                classification.input_hash,
+                classification.schema_version,
+                classification.provider,
+                classification.model,
+                classification.prompt_version,
+                classification.broad_category,
+                classification.status.as_str(),
+                classification.error,
+                serde_json::to_string(classification)?,
+                classification.created_at,
+                classification.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn classification_is_reusable(
+        &self,
+        profile_id: &str,
+        skill_id: &str,
+        input_hash: &str,
+        analysis_identity: (&str, &str),
+        schema_identity: (&str, &str),
+    ) -> DatabaseResult<bool> {
+        let (provider, model) = analysis_identity;
+        let (schema_version, prompt_version) = schema_identity;
+        self.connection()?
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM skill_classifications
+                    WHERE profile_id = ?1 AND skill_id = ?2 AND input_hash = ?3
+                      AND provider = ?4 AND model = ?5 AND schema_version = ?6
+                      AND prompt_version = ?7 AND status = 'ready'
+                )
+                "#,
+                params![
+                    profile_id,
+                    skill_id,
+                    input_hash,
+                    provider,
+                    model,
+                    schema_version,
+                    prompt_version
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn classification_retry_skill_ids(&self, profile_id: &str) -> DatabaseResult<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT skill_id FROM skill_classifications WHERE profile_id = ?1 AND status IN ('expired', 'failed', 'pending') ORDER BY skill_id",
+        )?;
+        let rows = statement
+            .query_map([profile_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        rows
+    }
+
+    pub fn mark_skill_classification_failed(
+        &self,
+        profile_id: &str,
+        skill_id: &str,
+        input_hash: &str,
+        analysis_identity: (&str, &str),
+        error: &str,
+        updated_at: i64,
+    ) -> DatabaseResult<()> {
+        let (provider, model) = analysis_identity;
+        if let Some(mut existing) = self.skill_classification(profile_id, skill_id)? {
+            existing.status = SemanticRecordStatus::Expired;
+            existing.error = Some(error.to_string());
+            existing.updated_at = updated_at;
+            return self.save_skill_classification(&existing);
+        }
+        let failed = SkillClassification {
+            profile_id: profile_id.to_string(),
+            skill_id: skill_id.to_string(),
+            input_hash: input_hash.to_string(),
+            schema_version: crate::pipeline::CLASSIFICATION_SCHEMA_VERSION.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt_version: crate::pipeline::CLASSIFICATION_PROMPT_VERSION.to_string(),
+            broad_category: String::new(),
+            small_categories: Vec::new(),
+            target_object: String::new(),
+            user_goal: String::new(),
+            capability_summary: String::new(),
+            workflow_summary: String::new(),
+            confidence: 0.0,
+            evidence: Vec::new(),
+            status: SemanticRecordStatus::Failed,
+            error: Some(error.to_string()),
+            created_at: updated_at,
+            updated_at,
+        };
+        self.save_skill_classification(&failed)
+    }
+
+    pub fn cluster_semantics_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> DatabaseResult<Vec<ClusterSemantic>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT record_json FROM cluster_semantics WHERE profile_id = ?1 ORDER BY cluster_id",
+        )?;
+        let rows = statement.query_map([profile_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let value = row?;
+            serde_json::from_str(&value).map_err(Into::into)
+        })
+        .collect()
+    }
+
+    pub fn cluster_semantic_is_reusable(
+        &self,
+        profile_id: &str,
+        cluster_id: &str,
+        member_hash: &str,
+        provider: &str,
+        model: &str,
+    ) -> DatabaseResult<bool> {
+        self.connection()?
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1 FROM cluster_semantics
+                    WHERE profile_id = ?1 AND cluster_id = ?2 AND member_hash = ?3
+                      AND provider = ?4 AND model = ?5 AND status = 'ready'
+                )
+                "#,
+                params![profile_id, cluster_id, member_hash, provider, model],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn save_cluster_semantic(&self, semantic: &ClusterSemantic) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO cluster_semantics (
+                profile_id, cluster_id, member_hash, schema_version, provider,
+                model, prompt_version, status, error, record_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(profile_id, cluster_id) DO UPDATE SET
+                member_hash = excluded.member_hash,
+                schema_version = excluded.schema_version,
+                provider = excluded.provider,
+                model = excluded.model,
+                prompt_version = excluded.prompt_version,
+                status = excluded.status,
+                error = excluded.error,
+                record_json = excluded.record_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                semantic.profile_id,
+                semantic.cluster_id,
+                semantic.member_hash,
+                semantic.schema_version,
+                semantic.provider,
+                semantic.model,
+                semantic.prompt_version,
+                semantic.status.as_str(),
+                semantic.error,
+                serde_json::to_string(semantic)?,
+                semantic.created_at,
+                semantic.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_cluster_semantic_failed(
+        &self,
+        profile_id: &str,
+        cluster_id: &str,
+        member_hash: &str,
+        analysis_identity: (&str, &str),
+        fallback: (&str, &str),
+        updated_at: i64,
+    ) -> DatabaseResult<()> {
+        let (provider, model) = analysis_identity;
+        let (temporary_name, error) = fallback;
+        let existing = self
+            .cluster_semantics_for_profile(profile_id)?
+            .into_iter()
+            .find(|item| item.cluster_id == cluster_id);
+        let semantic = if let Some(mut existing) = existing {
+            existing.status = SemanticRecordStatus::Expired;
+            existing.error = Some(error.to_string());
+            existing.member_hash = member_hash.to_string();
+            existing.updated_at = updated_at;
+            existing
+        } else {
+            ClusterSemantic {
+                profile_id: profile_id.to_string(),
+                cluster_id: cluster_id.to_string(),
+                member_hash: member_hash.to_string(),
+                schema_version: crate::pipeline::CLUSTER_SEMANTIC_SCHEMA_VERSION.to_string(),
+                provider: provider.to_string(),
+                model: model.to_string(),
+                prompt_version: crate::pipeline::CLUSTER_SEMANTIC_PROMPT_VERSION.to_string(),
+                name: temporary_name.to_string(),
+                summary: "集群语义生成失败，等待下次增量更新重试。".to_string(),
+                status: SemanticRecordStatus::Failed,
+                error: Some(error.to_string()),
+                created_at: updated_at,
+                updated_at,
+            }
+        };
+        self.save_cluster_semantic(&semantic)
+    }
+
+    pub fn remove_obsolete_cluster_semantics(
+        &self,
+        profile_id: &str,
+        cluster_ids: &[String],
+    ) -> DatabaseResult<()> {
+        let existing = self.cluster_semantics_for_profile(profile_id)?;
+        let connection = self.connection()?;
+        for semantic in existing {
+            if !cluster_ids.contains(&semantic.cluster_id) {
+                connection.execute(
+                    "DELETE FROM cluster_semantics WHERE profile_id = ?1 AND cluster_id = ?2",
+                    params![profile_id, semantic.cluster_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn expire_skill_vectors(
         &self,
         profile_id: &str,
@@ -1801,6 +2096,10 @@ impl Database {
                     "DELETE FROM indexed_skills WHERE profile_id = ?1 AND skill_id = ?2",
                     params![profile_id, skill_id],
                 )?;
+                transaction.execute(
+                    "DELETE FROM skill_classifications WHERE profile_id = ?1 AND skill_id = ?2",
+                    params![profile_id, skill_id],
+                )?;
             }
         }
         transaction.commit()?;
@@ -1824,6 +2123,7 @@ impl Database {
             "UPDATE skill_relations SET source_skill_id = ?2 WHERE source_skill_id = ?1",
             "UPDATE skill_relations SET target_skill_id = ?2 WHERE target_skill_id = ?1",
             "UPDATE indexed_skills SET skill_id = ?2 WHERE skill_id = ?1",
+            "UPDATE skill_classifications SET skill_id = ?2 WHERE skill_id = ?1",
         ] {
             transaction.execute(statement, params![old_id, new_id])?;
         }
@@ -2917,6 +3217,9 @@ fn migrate(connection: &mut Connection) -> DatabaseResult<()> {
     if version < 6 {
         migration_v6(connection.transaction()?)?;
     }
+    if version < 7 {
+        migration_v7(connection.transaction()?)?;
+    }
     let final_version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
@@ -3439,6 +3742,54 @@ fn migration_v6(transaction: Transaction<'_>) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn migration_v7(transaction: Transaction<'_>) -> DatabaseResult<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE skill_classifications (
+            profile_id TEXT NOT NULL REFERENCES embedding_profiles(profile_id) ON DELETE CASCADE,
+            skill_id TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            broad_category TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('ready', 'expired', 'failed', 'pending')),
+            error TEXT,
+            record_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(profile_id, skill_id)
+        );
+
+        CREATE TABLE cluster_semantics (
+            profile_id TEXT NOT NULL REFERENCES embedding_profiles(profile_id) ON DELETE CASCADE,
+            cluster_id TEXT NOT NULL,
+            member_hash TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('ready', 'expired', 'failed', 'pending')),
+            error TEXT,
+            record_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(profile_id, cluster_id)
+        );
+
+        CREATE INDEX skill_classifications_status_idx
+            ON skill_classifications(profile_id, status, skill_id);
+        CREATE INDEX cluster_semantics_status_idx
+            ON cluster_semantics(profile_id, status, cluster_id);
+
+        INSERT INTO schema_version(version, applied_at) VALUES (7, unixepoch());
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn profile_from_raw(raw: RawProfile) -> DatabaseResult<EmbeddingProfile> {
     Ok(EmbeddingProfile {
         profile_id: raw.0,
@@ -3692,6 +4043,8 @@ mod tests {
             "analysis_llm_results",
             "analysis_comparisons",
             "analysis_conflicts",
+            "skill_classifications",
+            "cluster_semantics",
             "indexed_skills",
             "index_settings",
         ] {
@@ -3736,6 +4089,109 @@ mod tests {
                 .unwrap()
                 .snapshot_id,
             "snapshot-2"
+        );
+    }
+
+    #[test]
+    fn classification_and_cluster_semantics_round_trip_and_failures_become_retryable() {
+        let database = Database::in_memory().unwrap();
+        database
+            .upsert_profile(&profile("profile-semantic", ProfileStatus::Draft))
+            .unwrap();
+        let classification = SkillClassification {
+            profile_id: "profile-semantic".to_string(),
+            skill_id: "skill-web".to_string(),
+            input_hash: "classification-hash".to_string(),
+            schema_version: crate::pipeline::CLASSIFICATION_SCHEMA_VERSION.to_string(),
+            provider: "openai".to_string(),
+            model: "model-test".to_string(),
+            prompt_version: crate::pipeline::CLASSIFICATION_PROMPT_VERSION.to_string(),
+            broad_category: "网页前端开发".to_string(),
+            small_categories: vec!["组件实现".to_string(), "无障碍".to_string()],
+            target_object: "网页界面".to_string(),
+            user_goal: "交付一致体验".to_string(),
+            capability_summary: "设计和实现网页组件".to_string(),
+            workflow_summary: "定义语言、实现组件、检查体验".to_string(),
+            confidence: 0.9,
+            evidence: Vec::new(),
+            status: SemanticRecordStatus::Ready,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        database.save_skill_classification(&classification).unwrap();
+        assert!(database
+            .classification_is_reusable(
+                "profile-semantic",
+                "skill-web",
+                "classification-hash",
+                ("openai", "model-test"),
+                (
+                    crate::pipeline::CLASSIFICATION_SCHEMA_VERSION,
+                    crate::pipeline::CLASSIFICATION_PROMPT_VERSION,
+                ),
+            )
+            .unwrap());
+        database
+            .mark_skill_classification_failed(
+                "profile-semantic",
+                "skill-web",
+                "new-hash",
+                ("openai", "model-test"),
+                "temporary failure",
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .skill_classification("profile-semantic", "skill-web")
+                .unwrap()
+                .unwrap()
+                .status,
+            SemanticRecordStatus::Expired
+        );
+
+        let semantic = ClusterSemantic {
+            profile_id: "profile-semantic".to_string(),
+            cluster_id: "cluster-web".to_string(),
+            member_hash: "member-hash".to_string(),
+            schema_version: crate::pipeline::CLUSTER_SEMANTIC_SCHEMA_VERSION.to_string(),
+            provider: "openai".to_string(),
+            model: "model-test".to_string(),
+            prompt_version: crate::pipeline::CLUSTER_SEMANTIC_PROMPT_VERSION.to_string(),
+            name: "前端体验".to_string(),
+            summary: "网页设计与组件实现。".to_string(),
+            status: SemanticRecordStatus::Ready,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        database.save_cluster_semantic(&semantic).unwrap();
+        assert!(database
+            .cluster_semantic_is_reusable(
+                "profile-semantic",
+                "cluster-web",
+                "member-hash",
+                "openai",
+                "model-test",
+            )
+            .unwrap());
+        database
+            .mark_cluster_semantic_failed(
+                "profile-semantic",
+                "cluster-web",
+                "member-hash-2",
+                ("openai", "model-test"),
+                ("临时名称", "temporary failure"),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .cluster_semantics_for_profile("profile-semantic")
+                .unwrap()[0]
+                .status,
+            SemanticRecordStatus::Expired
         );
     }
 

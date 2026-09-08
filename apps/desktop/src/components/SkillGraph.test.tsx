@@ -26,6 +26,7 @@ const graph = {
       memberSkillIds: ["a", "b"],
       coreSkillIds: ["a", "b"],
       peripheral: false,
+      semanticStatus: "ready" as const,
     },
   ],
   proximities: [],
@@ -40,6 +41,7 @@ const graph = {
       clusterId: "cluster-dev",
       centrality: 0.92,
       superseded: false,
+      classificationStatus: "ready" as const,
     },
     {
       skillId: "b",
@@ -51,6 +53,7 @@ const graph = {
       clusterId: "cluster-dev",
       centrality: 0.88,
       superseded: false,
+      classificationStatus: "ready" as const,
     },
   ],
   edges: [

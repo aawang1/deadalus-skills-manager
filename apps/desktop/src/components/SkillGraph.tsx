@@ -404,7 +404,7 @@ export function SkillGraph({
               return (
                 <g
                   key={cluster.clusterId}
-                  className={`skill-graph__cluster${selectedCluster && selectedCluster.clusterId !== cluster.clusterId ? " is-muted" : ""}`}
+                  className={`skill-graph__cluster${cluster.semanticStatus !== "ready" ? " is-semantic-stale" : ""}${selectedCluster && selectedCluster.clusterId !== cluster.clusterId ? " is-muted" : ""}`}
                 >
                   <circle className="skill-graph__cluster-cloud" cx={geometry.x} cy={geometry.y} r={geometry.radius} />
                   {cluster.coreSkillIds.map((skillId) => {
@@ -458,7 +458,7 @@ export function SkillGraph({
               return (
                 <g
                   key={node.skillId}
-                  className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${node.disabled ? " is-disabled" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`}
+                  className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${node.disabled ? " is-disabled" : ""}${node.classificationStatus !== "ready" ? " is-classification-stale" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`}
                   transform={`translate(${point.x} ${point.y})`}
                   tabIndex={0}
                   role="button"
@@ -664,6 +664,7 @@ function NodePopup({
         <p>{node.description || "暂无简介"}</p>
         <small>{node.enabledAgents.join(" · ")}</small>
         {node.disabled && <small>当前 Agent 中已禁用</small>}
+        {node.classificationStatus !== "ready" && <small>分类已过期，等待增量更新重试</small>}
         <code title={node.path}>{node.path}</code>
       </div>
     </foreignObject>
@@ -694,6 +695,7 @@ function ClusterPopup({
         <strong>{cluster.name}</strong>
         <p>{cluster.summary}</p>
         <small>{cluster.memberSkillIds.length} 个 Skills</small>
+        {cluster.semanticStatus !== "ready" && <small>待生成：下次增量更新将重试</small>}
       </div>
     </foreignObject>
   );

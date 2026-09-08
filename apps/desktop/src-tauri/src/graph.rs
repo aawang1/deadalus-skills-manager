@@ -1,3 +1,4 @@
+use crate::application::{ClusterSemantic, SemanticRecordStatus, SkillClassification};
 use crate::database::{CanonicalSkill, CanonicalSnapshot};
 use crate::vectorization::{
     stable_hash, RelationshipState, RelationshipType, SkillRelationship, StoredVector, VectorLevel,
@@ -11,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub const VISUAL_SIMILARITY_THRESHOLD: f32 = 0.72;
 pub const VISUAL_EDGE_TOP_K: usize = 5;
 pub const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.78;
+pub const CLASSIFIED_VECTOR_FLOOR: f32 = 0.62;
+pub const CLASSIFICATION_AFFINITY_THRESHOLD: f32 = 0.20;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +42,7 @@ pub struct SkillGraphNode {
     pub centrality: f32,
     pub superseded: bool,
     pub disabled: bool,
+    pub classification_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -50,6 +54,7 @@ pub struct SkillGraphCluster {
     pub member_skill_ids: Vec<String>,
     pub core_skill_ids: Vec<String>,
     pub peripheral: bool,
+    pub semantic_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -122,12 +127,46 @@ pub fn build_skill_graph(
     relationships: &[SkillRelationship],
     view_id: &str,
 ) -> SkillGraphSnapshot {
+    let classifications = snapshot
+        .skills
+        .iter()
+        .map(|skill| synthetic_ready_classification(profile_id, skill))
+        .collect::<Vec<_>>();
+    build_classified_skill_graph(
+        snapshot,
+        profile_id,
+        vectors,
+        relationships,
+        &classifications,
+        &[],
+        view_id,
+    )
+}
+
+pub fn build_classified_skill_graph(
+    snapshot: &CanonicalSnapshot,
+    profile_id: &str,
+    vectors: &[StoredVector],
+    relationships: &[SkillRelationship],
+    classifications: &[SkillClassification],
+    cluster_semantics: &[ClusterSemantic],
+    view_id: &str,
+) -> SkillGraphSnapshot {
     let visible_skills = snapshot
         .skills
         .iter()
         .filter(|skill| belongs_to_view(skill, view_id))
         .collect::<Vec<_>>();
     let ready_vectors = ready_overall_vectors(vectors);
+    let all_ready_skills = snapshot
+        .skills
+        .iter()
+        .filter_map(|skill| {
+            ready_vectors
+                .get(&skill.skill_id)
+                .map(|vector| (skill.skill_id.clone(), (skill, *vector)))
+        })
+        .collect::<BTreeMap<_, _>>();
     let ready_skills = visible_skills
         .iter()
         .filter_map(|skill| {
@@ -146,9 +185,18 @@ pub fn build_skill_graph(
             .map(|(skill_id, _)| skill_id.clone())
             .collect::<HashSet<_>>()
     };
-    let active_ready_skills = ready_skills
+    let classification_by_skill = classifications
         .iter()
-        .filter(|(skill_id, _)| !disabled_ids.contains(*skill_id))
+        .filter(|classification| classification.profile_id == profile_id)
+        .map(|classification| (classification.skill_id.clone(), classification))
+        .collect::<HashMap<_, _>>();
+    let clusterable_skills = all_ready_skills
+        .iter()
+        .filter(|(skill_id, _)| {
+            classification_by_skill
+                .get(*skill_id)
+                .is_some_and(|classification| classification.status == SemanticRecordStatus::Ready)
+        })
         .map(|(skill_id, value)| (skill_id.clone(), *value))
         .collect::<BTreeMap<_, _>>();
     let relevant_relationships = relationships
@@ -166,8 +214,8 @@ pub fn build_skill_graph(
         .collect::<HashSet<_>>();
 
     let mut similarities = Vec::new();
-    let ready_ids = active_ready_skills.keys().cloned().collect::<Vec<_>>();
-    let normalized_vectors = active_ready_skills
+    let ready_ids = clusterable_skills.keys().cloned().collect::<Vec<_>>();
+    let normalized_vectors = clusterable_skills
         .iter()
         .filter_map(|(skill_id, (_, vector))| {
             normalize(&vector.vector).map(|normalized| (skill_id.clone(), normalized))
@@ -201,8 +249,61 @@ pub fn build_skill_graph(
     }
 
     let excluded_unconnected_count = 0;
-    let (clusters, cluster_by_skill, centrality_by_skill) =
-        build_clusters(&active_ready_skills, &similarities);
+    let (all_clusters, all_cluster_by_skill, centrality_by_skill) = build_clusters(
+        &clusterable_skills,
+        &similarities,
+        &classification_by_skill,
+        cluster_semantics,
+    );
+    let visible_clusterable_ids = ready_skills
+        .keys()
+        .filter(|skill_id| {
+            !disabled_ids.contains(*skill_id)
+                && classification_by_skill
+                    .get(*skill_id)
+                    .is_some_and(|classification| {
+                        classification.status == SemanticRecordStatus::Ready
+                    })
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    let clusters = all_clusters
+        .into_iter()
+        .filter_map(|mut cluster| {
+            cluster
+                .member_skill_ids
+                .retain(|skill_id| visible_clusterable_ids.contains(skill_id));
+            if cluster.member_skill_ids.len() < 2 {
+                return None;
+            }
+            cluster
+                .core_skill_ids
+                .retain(|skill_id| visible_clusterable_ids.contains(skill_id));
+            if cluster.core_skill_ids.is_empty() {
+                let mut ranked = cluster.member_skill_ids.clone();
+                ranked.sort_by(|left, right| {
+                    centrality_by_skill
+                        .get(right)
+                        .unwrap_or(&0.0)
+                        .partial_cmp(centrality_by_skill.get(left).unwrap_or(&0.0))
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| left.cmp(right))
+                });
+                cluster.core_skill_ids = ranked.into_iter().take(2).collect();
+            }
+            Some(cluster)
+        })
+        .collect::<Vec<_>>();
+    let retained_clusters = clusters
+        .iter()
+        .map(|cluster| cluster.cluster_id.clone())
+        .collect::<HashSet<_>>();
+    let cluster_by_skill = all_cluster_by_skill
+        .into_iter()
+        .filter(|(skill_id, cluster_id)| {
+            visible_clusterable_ids.contains(skill_id) && retained_clusters.contains(cluster_id)
+        })
+        .collect::<HashMap<_, _>>();
     let superseded_ids = confirmed_superseded_ids(&relevant_relationships);
     let nodes = ready_skills
         .values()
@@ -213,12 +314,16 @@ pub fn build_skill_graph(
                 *centrality_by_skill.get(&skill.skill_id).unwrap_or(&0.0),
                 superseded_ids.contains(&skill.skill_id),
                 disabled_ids.contains(&skill.skill_id),
+                classification_by_skill
+                    .get(&skill.skill_id)
+                    .map(|classification| classification.status.as_str())
+                    .unwrap_or("missing"),
             )
         })
         .collect::<Vec<_>>();
     let node_ids = nodes
         .iter()
-        .filter(|node| !node.disabled)
+        .filter(|node| !node.disabled && node.classification_status == "ready")
         .map(|node| node.skill_id.clone())
         .collect::<HashSet<_>>();
 
@@ -304,6 +409,36 @@ pub fn build_skill_graph(
     }
 }
 
+fn synthetic_ready_classification(profile_id: &str, skill: &CanonicalSkill) -> SkillClassification {
+    SkillClassification {
+        profile_id: profile_id.to_string(),
+        skill_id: skill.skill_id.clone(),
+        input_hash: skill.content_hash.clone(),
+        schema_version: "legacy-test".to_string(),
+        provider: "deterministic".to_string(),
+        model: "deterministic".to_string(),
+        prompt_version: "legacy-test".to_string(),
+        broad_category: "legacy-test".to_string(),
+        small_categories: vec!["legacy-test".to_string()],
+        target_object: "legacy-test".to_string(),
+        user_goal: "legacy-test".to_string(),
+        capability_summary: skill
+            .description
+            .clone()
+            .unwrap_or_else(|| skill.name.clone()),
+        workflow_summary: skill
+            .description
+            .clone()
+            .unwrap_or_else(|| skill.name.clone()),
+        confidence: 1.0,
+        evidence: Vec::new(),
+        status: SemanticRecordStatus::Ready,
+        error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
 fn belongs_to_view(skill: &CanonicalSkill, view_id: &str) -> bool {
     view_id == "all" || skill.enabled_agents.iter().any(|agent| agent == view_id)
 }
@@ -333,6 +468,7 @@ fn graph_node(
     centrality: f32,
     superseded: bool,
     disabled: bool,
+    classification_status: &str,
 ) -> SkillGraphNode {
     SkillGraphNode {
         skill_id: skill.skill_id.clone(),
@@ -344,6 +480,7 @@ fn graph_node(
         centrality,
         superseded,
         disabled,
+        classification_status: classification_status.to_string(),
     }
 }
 
@@ -472,6 +609,8 @@ fn build_proximities(
 fn build_clusters(
     ready_skills: &BTreeMap<String, (&CanonicalSkill, &StoredVector)>,
     similarities: &[PairSimilarity],
+    classifications: &HashMap<String, &SkillClassification>,
+    cluster_semantics: &[ClusterSemantic],
 ) -> (
     Vec<SkillGraphCluster>,
     HashMap<String, String>,
@@ -481,10 +620,15 @@ fn build_clusters(
         .keys()
         .map(|id| (id.clone(), Vec::<String>::new()))
         .collect::<HashMap<_, _>>();
-    for pair in similarities
-        .iter()
-        .filter(|pair| pair.score >= CLUSTER_SIMILARITY_THRESHOLD)
-    {
+    for pair in similarities.iter().filter(|pair| {
+        let (Some(source), Some(target)) = (
+            classifications.get(&pair.source),
+            classifications.get(&pair.target),
+        ) else {
+            return false;
+        };
+        category_compatible(source, target, pair.score)
+    }) {
         adjacency
             .entry(pair.source.clone())
             .or_default()
@@ -549,62 +693,171 @@ fn build_clusters(
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| left.cmp(right))
         });
-        let skills = members
+        let member_classifications = members
             .iter()
-            .filter_map(|id| ready_skills.get(id).map(|(skill, _)| *skill))
+            .filter_map(|id| classifications.get(id).copied())
             .collect::<Vec<_>>();
+        let temporary_name = temporary_cluster_name(&member_classifications);
+        let semantic = cluster_semantics
+            .iter()
+            .find(|semantic| semantic.cluster_id == cluster_id);
+        let (name, summary, semantic_status) = match semantic {
+            Some(semantic) if semantic.status == SemanticRecordStatus::Ready => (
+                semantic.name.clone(),
+                semantic.summary.clone(),
+                semantic.status.as_str().to_string(),
+            ),
+            Some(semantic) => (
+                temporary_name,
+                "集群语义已过期，等待重新生成。".to_string(),
+                semantic.status.as_str().to_string(),
+            ),
+            None => (
+                temporary_name,
+                "临时分类名称，等待 LLM 生成集群概述。".to_string(),
+                "pending".to_string(),
+            ),
+        };
         clusters.push(SkillGraphCluster {
             cluster_id,
-            name: cluster_name(&skills),
-            summary: cluster_summary(&skills),
+            name,
+            summary,
             member_skill_ids: members,
             core_skill_ids: ranked.into_iter().take(core_count).collect(),
             peripheral: false,
+            semantic_status,
         });
     }
     clusters.sort_by(|left, right| left.cluster_id.cmp(&right.cluster_id));
     (clusters, cluster_by_skill, centrality_by_skill)
 }
 
-fn cluster_name(skills: &[&CanonicalSkill]) -> String {
-    let stop_words = [
-        "skill", "skills", "tool", "agent", "the", "and", "for", "with",
-    ];
-    let mut counts = BTreeMap::<String, usize>::new();
-    for skill in skills {
-        for token in skill
-            .name
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|token| token.chars().count() >= 2)
-        {
-            let normalized = token.to_lowercase();
-            if !stop_words.contains(&normalized.as_str()) {
-                *counts.entry(normalized).or_default() += 1;
-            }
-        }
+fn category_compatible(
+    source: &SkillClassification,
+    target: &SkillClassification,
+    vector_similarity: f32,
+) -> bool {
+    let source_broad = normalize_label(&source.broad_category);
+    let target_broad = normalize_label(&target.broad_category);
+    let broad_affinity = jaccard(
+        &semantic_terms(&source.broad_category),
+        &semantic_terms(&target.broad_category),
+    );
+    // Broad categories are a strong boundary, but not a brittle enum: the LLM
+    // may produce near-synonyms such as “网页前端” and “前端界面开发”.  Exact
+    // labels always match; otherwise substantial semantic overlap is required.
+    // Generic shared words such as “设计” are insufficient on their own.
+    if source_broad != target_broad && broad_affinity < 0.45 {
+        return false;
     }
-    counts
-        .into_iter()
-        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
-        .map(|(token, _)| token)
-        .or_else(|| skills.first().map(|skill| skill.name.clone()))
-        .unwrap_or_else(|| "功能集群".to_string())
+    let required_affinity = if vector_similarity >= CLUSTER_SIMILARITY_THRESHOLD {
+        CLASSIFICATION_AFFINITY_THRESHOLD * 0.75
+    } else {
+        CLASSIFICATION_AFFINITY_THRESHOLD
+    };
+    classification_affinity(source, target) >= required_affinity
+        && vector_similarity >= CLASSIFIED_VECTOR_FLOOR
 }
 
-fn cluster_summary(skills: &[&CanonicalSkill]) -> String {
-    let descriptions = skills
+fn classification_affinity(source: &SkillClassification, target: &SkillClassification) -> f32 {
+    let source_small = source
+        .small_categories
         .iter()
-        .filter_map(|skill| skill.description.as_deref())
-        .filter(|description| !description.trim().is_empty())
-        .take(3)
-        .collect::<Vec<_>>();
-    if descriptions.is_empty() {
-        format!("包含 {} 个功能相近的 Skills。", skills.len())
-    } else {
-        let joined = descriptions.join("；");
-        let summary = joined.chars().take(180).collect::<String>();
-        format!("{} 个 Skills：{}", skills.len(), summary)
+        .flat_map(|value| semantic_terms(value))
+        .collect::<BTreeSet<_>>();
+    let target_small = target
+        .small_categories
+        .iter()
+        .flat_map(|value| semantic_terms(value))
+        .collect::<BTreeSet<_>>();
+    0.45 * jaccard(&source_small, &target_small)
+        + 0.25
+            * jaccard(
+                &semantic_terms(&source.target_object),
+                &semantic_terms(&target.target_object),
+            )
+        + 0.15
+            * jaccard(
+                &semantic_terms(&source.user_goal),
+                &semantic_terms(&target.user_goal),
+            )
+        + 0.15
+            * jaccard(
+                &semantic_terms(&source.workflow_summary),
+                &semantic_terms(&target.workflow_summary),
+            )
+}
+
+fn normalize_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn semantic_terms(value: &str) -> BTreeSet<String> {
+    let mut terms = value
+        .split(|character: char| !character.is_alphanumeric())
+        .map(normalize_label)
+        .filter(|term| !term.is_empty())
+        .collect::<BTreeSet<_>>();
+    let compact = normalize_label(value);
+    if !compact.is_empty() {
+        terms.insert(compact.clone());
     }
+    let characters = compact.chars().collect::<Vec<_>>();
+    if characters.iter().any(|character| !character.is_ascii()) {
+        for pair in characters.windows(2) {
+            terms.insert(pair.iter().collect());
+        }
+    }
+    terms
+}
+
+fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    left.intersection(right).count() as f32 / left.union(right).count() as f32
+}
+
+fn temporary_cluster_name(classifications: &[&SkillClassification]) -> String {
+    let mut counts = BTreeMap::<String, (String, usize)>::new();
+    for classification in classifications {
+        let key = normalize_label(&classification.broad_category);
+        let entry = counts
+            .entry(key)
+            .or_insert_with(|| (classification.broad_category.clone(), 0));
+        entry.1 += 1;
+    }
+    counts
+        .into_values()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(name, _)| format!("{name} · 待生成"))
+        .unwrap_or_else(|| "功能集群 · 待生成".to_string())
+}
+
+pub fn cluster_member_hash(
+    member_skill_ids: &[String],
+    classifications: &[SkillClassification],
+) -> String {
+    let by_skill = classifications
+        .iter()
+        .map(|item| (item.skill_id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    let mut members = member_skill_ids.to_vec();
+    members.sort();
+    let values = members
+        .iter()
+        .map(|skill_id| {
+            by_skill.get(skill_id.as_str()).map_or_else(
+                || skill_id.clone(),
+                |item| format!("{}:{}", item.skill_id, item.input_hash),
+            )
+        })
+        .collect::<Vec<_>>();
+    stable_hash(values.join("\0").as_bytes())
 }
 
 fn vector_similarity_relation(score: f32, fallback: bool) -> SkillGraphRelation {
@@ -717,24 +970,26 @@ fn graph_version(
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
         parts.push(format!(
-            "{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}",
             node.skill_id,
             node.name,
             node.description.as_deref().unwrap_or_default(),
             node.path,
             node.enabled_agents.join(","),
             node.disabled,
+            node.classification_status,
             vector_version,
         ));
     }
     for cluster in clusters {
         parts.push(format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             cluster.cluster_id,
             cluster.name,
             cluster.summary,
             cluster.member_skill_ids.join(","),
             cluster.core_skill_ids.join(","),
+            cluster.semantic_status,
         ));
     }
     for edge in edges {
@@ -781,8 +1036,8 @@ fn layout_version(
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
         parts.push(format!(
-            "{}:{}:{}",
-            node.skill_id, node.disabled, vector_version
+            "{}:{}:{}:{}",
+            node.skill_id, node.disabled, node.classification_status, vector_version
         ));
     }
     stable_hash(parts.join("\n").as_bytes())
@@ -852,6 +1107,30 @@ mod tests {
             status: VectorStatus::Ready,
             heading_path: None,
             source_file: None,
+        }
+    }
+
+    fn classification(id: &str, broad: &str, small: &[&str], target: &str) -> SkillClassification {
+        SkillClassification {
+            profile_id: "profile".to_string(),
+            skill_id: id.to_string(),
+            input_hash: format!("classification-{id}"),
+            schema_version: "v1".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            prompt_version: "v1".to_string(),
+            broad_category: broad.to_string(),
+            small_categories: small.iter().map(|value| (*value).to_string()).collect(),
+            target_object: target.to_string(),
+            user_goal: format!("完成 {target}"),
+            capability_summary: format!("处理 {target}"),
+            workflow_summary: small.join(" "),
+            confidence: 0.9,
+            evidence: Vec::new(),
+            status: SemanticRecordStatus::Ready,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
         }
     }
 
@@ -938,6 +1217,62 @@ mod tests {
             .unwrap()
             .cluster_id
             .is_none());
+    }
+
+    #[test]
+    fn classification_prevents_generic_design_similarity_from_merging_domains() {
+        let source = snapshot(vec![
+            skill("web-design", "cursor"),
+            skill("web-a11y", "cursor"),
+            skill("game-design", "cursor"),
+        ]);
+        let vectors = [
+            vector("web-design", vec![1.0, 0.0]),
+            vector("web-a11y", vec![0.99, 0.01]),
+            vector("game-design", vec![0.995, 0.005]),
+        ];
+        let classifications = [
+            classification(
+                "web-design",
+                "网页前端设计",
+                &["设计系统", "界面实现"],
+                "网页界面",
+            ),
+            classification(
+                "web-a11y",
+                "网页前端设计",
+                &["界面实现", "无障碍"],
+                "网页界面",
+            ),
+            classification(
+                "game-design",
+                "多人游戏设计",
+                &["玩法系统", "网络协同"],
+                "多人游戏",
+            ),
+        ];
+        let graph = build_classified_skill_graph(
+            &source,
+            "profile",
+            &vectors,
+            &[],
+            &classifications,
+            &[],
+            "all",
+        );
+        assert_eq!(graph.clusters.len(), 1);
+        assert_eq!(graph.clusters[0].member_skill_ids.len(), 2);
+        assert!(graph.clusters[0]
+            .member_skill_ids
+            .contains(&"web-design".to_string()));
+        assert!(graph.clusters[0]
+            .member_skill_ids
+            .contains(&"web-a11y".to_string()));
+        assert!(graph
+            .nodes
+            .iter()
+            .find(|node| node.skill_id == "game-design")
+            .is_some_and(|node| node.cluster_id.is_none()));
     }
 
     #[test]

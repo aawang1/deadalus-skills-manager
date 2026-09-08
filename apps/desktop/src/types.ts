@@ -328,6 +328,7 @@ export interface SkillGraphNode {
   centrality: number;
   superseded: boolean;
   disabled: boolean;
+  classificationStatus: "ready" | "expired" | "failed" | "pending" | "missing";
 }
 
 export interface SkillGraphCluster {
@@ -337,6 +338,7 @@ export interface SkillGraphCluster {
   memberSkillIds: string[];
   coreSkillIds: string[];
   peripheral: boolean;
+  semanticStatus: "ready" | "expired" | "failed" | "pending";
 }
 
 export interface SkillGraphProximity {

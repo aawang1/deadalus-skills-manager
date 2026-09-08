@@ -107,6 +107,68 @@ pub enum ConflictResolutionStatus {
     NeedsReview,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRecordStatus {
+    Ready,
+    Expired,
+    Failed,
+    Pending,
+}
+
+impl SemanticRecordStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillClassification {
+    pub profile_id: String,
+    pub skill_id: String,
+    pub input_hash: String,
+    pub schema_version: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub broad_category: String,
+    pub small_categories: Vec<String>,
+    pub target_object: String,
+    pub user_goal: String,
+    pub capability_summary: String,
+    pub workflow_summary: String,
+    pub confidence: f32,
+    pub evidence: Vec<AnalysisEvidence>,
+    pub status: SemanticRecordStatus,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterSemantic {
+    pub profile_id: String,
+    pub cluster_id: String,
+    pub member_hash: String,
+    pub schema_version: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub name: String,
+    pub summary: String,
+    pub status: SemanticRecordStatus,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Error)]
 pub enum AnalysisProviderError {
     #[error("analysis provider is not configured")]

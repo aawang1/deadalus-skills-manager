@@ -35,12 +35,14 @@ use database::{
     Database, FeedbackEventRecord, LocalValidationMutation, ValidationRunRecord,
     ValidationSampleRecord,
 };
-use graph::{build_skill_graph, empty_graph, SkillGraphSnapshot};
+use graph::{build_classified_skill_graph, cluster_member_hash, empty_graph, SkillGraphSnapshot};
 use pipeline::{
-    compare_analysis, estimate_preflight, prepare_skill_inputs, rule_result, EmbeddingJobContext,
-    EmbeddingProvider, IndexDiff, IndexSyncStatus, JobStrategy, PreparedProfileChange,
-    ProfileChangeRequest, ProgressEvent, RemoteAnalysisProvider, RemoteEmbeddingProvider,
-    ReqwestJsonTransport, ToastMessage,
+    compare_analysis, estimate_preflight, prepare_skill_inputs, rule_result,
+    ClusterSemanticRequest, EmbeddingJobContext, EmbeddingProvider, IndexDiff, IndexSyncStatus,
+    JobStrategy, PreparedProfileChange, ProfileChangeRequest, ProgressEvent,
+    RemoteAnalysisProvider, RemoteEmbeddingProvider, ReqwestJsonTransport,
+    SkillClassificationRequest, ToastMessage, CLASSIFICATION_PROMPT_VERSION,
+    CLASSIFICATION_SCHEMA_VERSION,
 };
 use validation::{
     compute_metrics, generate_samples, split_for_family, EvaluatedSample, FeedbackAction,
@@ -1320,6 +1322,46 @@ fn incremental_work_snapshot(
     Ok(work)
 }
 
+fn incremental_semantic_work_snapshot(
+    database: &Database,
+    profile_id: &str,
+    snapshot: &CanonicalSnapshot,
+    analysis_provider: &str,
+    analysis_model: &str,
+) -> Result<CanonicalSnapshot, String> {
+    let mut work = incremental_work_snapshot(database, profile_id, snapshot)?;
+    let existing = database
+        .classifications_for_profile(profile_id)
+        .map_err(|error| format!("无法读取 Skill 分类：{error}"))?
+        .into_iter()
+        .map(|item| (item.skill_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut selected = work
+        .skills
+        .iter()
+        .map(|skill| skill.skill_id.clone())
+        .collect::<HashSet<_>>();
+    for skill in snapshot
+        .skills
+        .iter()
+        .filter(|skill| !skill.path.starts_with("bundled://"))
+    {
+        let reusable = existing.get(&skill.skill_id).is_some_and(|item| {
+            item.status == application::SemanticRecordStatus::Ready
+                && item.provider == analysis_provider
+                && item.model == analysis_model
+                && item.schema_version == CLASSIFICATION_SCHEMA_VERSION
+                && item.prompt_version == CLASSIFICATION_PROMPT_VERSION
+        });
+        if !reusable && selected.insert(skill.skill_id.clone()) {
+            work.skills.push(skill.clone());
+        }
+    }
+    work.skills
+        .sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+    Ok(work)
+}
+
 #[tauri::command]
 fn get_index_diff(database: State<'_, Database>) -> Result<IndexDiff, String> {
     database
@@ -1666,10 +1708,20 @@ fn start_embedding_job(
         return Ok(job);
     }
     let profile = staged.profile;
+    // Classification and cluster semantics are mandatory stages of every build.
+    // Validate the active Agent credential before creating an asynchronous Job,
+    // so a missing key is reported immediately rather than as a delayed failure.
+    let analysis_provider = active_analysis_provider(&app)?;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
     let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let estimate_snapshot = if strategy == JobStrategy::Incremental {
-        incremental_work_snapshot(database.inner(), &profile.profile_id, &snapshot)?
+        incremental_semantic_work_snapshot(
+            database.inner(),
+            &profile.profile_id,
+            &snapshot,
+            &analysis_provider.provider,
+            &analysis_provider.model,
+        )?
     } else {
         snapshot.clone()
     };
@@ -1679,7 +1731,7 @@ fn start_embedding_job(
         profile_id: profile.profile_id.clone(),
         kind: strategy.as_job_kind(),
         status: JobStatus::Pending,
-        total_items: estimate.parent_count + estimate.chunk_count_high,
+        total_items: estimate.skill_count + estimate.parent_count + estimate.chunk_count_high,
         completed_items: 0,
         estimated_tokens: estimate.embedding_tokens_high,
         actual_tokens: 0,
@@ -1851,11 +1903,19 @@ fn get_skill_graph(
     let relationships = database
         .relationships_for_profile(&profile.profile_id)
         .map_err(|error| format!("无法读取活动 Profile 关系：{error}"))?;
-    Ok(build_skill_graph(
+    let classifications = database
+        .classifications_for_profile(&profile.profile_id)
+        .map_err(|error| format!("无法读取 Skill 分类：{error}"))?;
+    let cluster_semantics = database
+        .cluster_semantics_for_profile(&profile.profile_id)
+        .map_err(|error| format!("无法读取集群语义：{error}"))?;
+    Ok(build_classified_skill_graph(
         &snapshot,
         &profile.profile_id,
         &vectors,
         &relationships,
+        &classifications,
+        &cluster_semantics,
         &view_id,
     ))
 }
@@ -2497,13 +2557,19 @@ async fn run_embedding_job_inner(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "规范快照不存在".to_string())?;
     let snapshot = snapshot_for_embedding(database, &snapshot)?;
+    let provider = RemoteEmbeddingProvider::new(&profile, api_key, ReqwestJsonTransport);
+    let analysis_provider = active_analysis_provider(app)?;
     let work_snapshot = if job.kind == vectorization::JobKind::Incremental {
-        incremental_work_snapshot(database, &profile.profile_id, &snapshot)?
+        incremental_semantic_work_snapshot(
+            database,
+            &profile.profile_id,
+            &snapshot,
+            &analysis_provider.provider,
+            &analysis_provider.model,
+        )?
     } else {
         snapshot.clone()
     };
-    let provider = RemoteEmbeddingProvider::new(&profile, api_key, ReqwestJsonTransport);
-    let analysis_provider = active_analysis_provider(app)?;
     let mut completed = 0u64;
     let mut actual_tokens = 0u64;
     let current_skill_ids = snapshot
@@ -2561,16 +2627,12 @@ async fn run_embedding_job_inner(
 
         let rule = rule_result(&skill.skill_id, &prepared.inputs);
         let analysis_cached = database
-            .has_analysis_for_input(
-                &skill.skill_id,
-                &rule.input_hash,
-                analysis_provider.is_some(),
-            )
+            .has_analysis_for_input(&skill.skill_id, &rule.input_hash, true)
             .map_err(|error| error.to_string())?;
         if analysis_cached {
             // Deterministic inputs and the requested analysis tier are already
             // available. Reuse them without another remote LLM call.
-        } else if let Some(analysis_provider) = &analysis_provider {
+        } else {
             let markdown = prepared
                 .inputs
                 .iter()
@@ -2584,41 +2646,103 @@ async fn run_embedding_job_inner(
                 schema_version: INPUT_SCHEMA_VERSION.to_string(),
                 phase: AnalysisPhase::StructureExtraction,
             };
-            match analysis_provider.analyze(request.clone()).await {
-                Ok(llm) => {
-                    let comparison = compare_analysis(&rule, &llm);
-                    let conflict = if comparison.status == application::ComparisonStatus::Conflict {
-                        match analysis_provider
-                            .resolve_conflict(request, &rule, &llm)
-                            .await
-                        {
-                            Ok(mut result) => {
-                                result.comparison_id = comparison.comparison_id.clone();
-                                Some(result)
-                            }
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    };
-                    database
-                        .save_analysis_results(
-                            &rule,
-                            Some(&llm),
-                            Some(&comparison),
-                            conflict.as_ref(),
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
-                Err(_) => database
-                    .save_analysis_results(&rule, None, None, None)
-                    .map_err(|error| error.to_string())?,
-            }
-        } else {
+            let llm = analysis_provider
+                .analyze(request.clone())
+                .await
+                .map_err(|error| format!("Skill 结构分析失败，任务已停止：{error}"))?;
+            let comparison = compare_analysis(&rule, &llm);
+            let conflict = if comparison.status == application::ComparisonStatus::Conflict {
+                let mut result = analysis_provider
+                    .resolve_conflict(request, &rule, &llm)
+                    .await
+                    .map_err(|error| format!("规则与 LLM 冲突复核失败，任务已停止：{error}"))?;
+                result.comparison_id = comparison.comparison_id.clone();
+                Some(result)
+            } else {
+                None
+            };
             database
-                .save_analysis_results(&rule, None, None, None)
+                .save_analysis_results(&rule, Some(&llm), Some(&comparison), conflict.as_ref())
                 .map_err(|error| error.to_string())?;
         }
+
+        let classification_input_hash = stable_hash(
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                rule.input_hash,
+                CLASSIFICATION_SCHEMA_VERSION,
+                CLASSIFICATION_PROMPT_VERSION,
+                analysis_provider.provider,
+                analysis_provider.model
+            )
+            .as_bytes(),
+        );
+        let classification_cached = database
+            .classification_is_reusable(
+                &profile.profile_id,
+                &skill.skill_id,
+                &classification_input_hash,
+                (&analysis_provider.provider, &analysis_provider.model),
+                (CLASSIFICATION_SCHEMA_VERSION, CLASSIFICATION_PROMPT_VERSION),
+            )
+            .map_err(|error| error.to_string())?;
+        if !classification_cached {
+            let request = SkillClassificationRequest {
+                profile_id: profile.profile_id.clone(),
+                skill_id: skill.skill_id.clone(),
+                input_hash: classification_input_hash.clone(),
+                skill_name: skill.name.clone(),
+                skill_description: skill.description.clone(),
+                structured_rule_fields: rule.fields.clone(),
+                content: classification_content(&prepared.inputs, 24_000),
+            };
+            let classified = match analysis_provider.classify_skill(&request).await {
+                Ok(classified) => classified,
+                Err(error) => {
+                    let message = format!("Skill 分类失败，任务已停止：{error}");
+                    database
+                        .mark_skill_classification_failed(
+                            &profile.profile_id,
+                            &skill.skill_id,
+                            &classification_input_hash,
+                            (&analysis_provider.provider, &analysis_provider.model),
+                            &message,
+                            unix_timestamp_i64()?,
+                        )
+                        .map_err(|database_error| database_error.to_string())?;
+                    return Err(message);
+                }
+            };
+            let classification =
+                if classified.rule_conflict || classified.classification.confidence < 0.55 {
+                    match analysis_provider
+                        .resolve_skill_classification(&request, &classified.classification)
+                        .await
+                    {
+                        Ok(resolved) => resolved.classification,
+                        Err(error) => {
+                            let message = format!("Skill 分类二次复核失败，任务已停止：{error}");
+                            database
+                                .mark_skill_classification_failed(
+                                    &profile.profile_id,
+                                    &skill.skill_id,
+                                    &classification_input_hash,
+                                    (&analysis_provider.provider, &analysis_provider.model),
+                                    &message,
+                                    unix_timestamp_i64()?,
+                                )
+                                .map_err(|database_error| database_error.to_string())?;
+                            return Err(message);
+                        }
+                    }
+                } else {
+                    classified.classification
+                };
+            database
+                .save_skill_classification(&classification)
+                .map_err(|error| error.to_string())?;
+        }
+        completed += 1;
 
         let mut pending = Vec::new();
         for input in &prepared.inputs {
@@ -2714,6 +2838,80 @@ async fn run_embedding_job_inner(
             .map_err(|error| error.to_string())?;
         emit_progress(app, job, completed);
     }
+    let classifications = database
+        .classifications_for_profile(&profile.profile_id)
+        .map_err(|error| error.to_string())?;
+    let current_vectors = database
+        .load_vectors(&profile.profile_id)
+        .map_err(|error| error.to_string())?;
+    let current_relationships = database
+        .relationships_for_profile(&profile.profile_id)
+        .map_err(|error| error.to_string())?;
+    let existing_cluster_semantics = database
+        .cluster_semantics_for_profile(&profile.profile_id)
+        .map_err(|error| error.to_string())?;
+    let classification_graph = build_classified_skill_graph(
+        &snapshot,
+        &profile.profile_id,
+        &current_vectors,
+        &current_relationships,
+        &classifications,
+        &existing_cluster_semantics,
+        "all",
+    );
+    let mut current_cluster_ids = Vec::new();
+    for cluster in &classification_graph.clusters {
+        current_cluster_ids.push(cluster.cluster_id.clone());
+        let member_hash = cluster_member_hash(&cluster.member_skill_ids, &classifications);
+        if database
+            .cluster_semantic_is_reusable(
+                &profile.profile_id,
+                &cluster.cluster_id,
+                &member_hash,
+                &analysis_provider.provider,
+                &analysis_provider.model,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        let members = classifications
+            .iter()
+            .filter(|classification| {
+                cluster.member_skill_ids.contains(&classification.skill_id)
+                    && classification.status == application::SemanticRecordStatus::Ready
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let request = ClusterSemanticRequest {
+            profile_id: profile.profile_id.clone(),
+            cluster_id: cluster.cluster_id.clone(),
+            member_hash: member_hash.clone(),
+            classifications: members,
+        };
+        match analysis_provider.summarize_cluster(&request).await {
+            Ok(semantic) => database
+                .save_cluster_semantic(&semantic)
+                .map_err(|error| error.to_string())?,
+            Err(error) => {
+                let message = format!("集群名称与概述生成失败，任务已停止：{error}");
+                database
+                    .mark_cluster_semantic_failed(
+                        &profile.profile_id,
+                        &cluster.cluster_id,
+                        &member_hash,
+                        (&analysis_provider.provider, &analysis_provider.model),
+                        (&cluster.name, &message),
+                        unix_timestamp_i64()?,
+                    )
+                    .map_err(|database_error| database_error.to_string())?;
+                return Err(message);
+            }
+        }
+    }
+    database
+        .remove_obsolete_cluster_semantics(&profile.profile_id, &current_cluster_ids)
+        .map_err(|error| error.to_string())?;
     database
         .remove_deleted_profile_skills(&profile.profile_id, &current_skill_ids)
         .map_err(|error| error.to_string())?;
@@ -2801,21 +2999,43 @@ async fn run_embedding_job_inner(
 
 fn active_analysis_provider(
     app: &AppHandle,
-) -> Result<Option<RemoteAnalysisProvider<ReqwestJsonTransport>>, String> {
+) -> Result<RemoteAnalysisProvider<ReqwestJsonTransport>, String> {
     let keys = read_key_metadata(app)?;
     let Some(key) = keys.iter().find(|key| key.is_agent_active) else {
-        return Ok(None);
+        return Err("向量化需要当前启用的 Agent API Key 进行 Skill 分类".to_string());
     };
     let Some(model) = key.agent_model.clone() else {
-        return Ok(None);
+        return Err("当前 Agent API Key 尚未选择可用的分析模型".to_string());
     };
     let api_key = read_credential_secret(&key.id)?;
-    Ok(Some(RemoteAnalysisProvider::new(
+    Ok(RemoteAnalysisProvider::new(
         key.provider.clone(),
         model,
         api_key,
         ReqwestJsonTransport,
-    )))
+    ))
+}
+
+fn classification_content(inputs: &[vectorization::GeneratedInput], max_chars: usize) -> String {
+    let mut output = String::new();
+    for input in inputs {
+        for piece in std::iter::once(input.text.as_str())
+            .chain(input.chunks.iter().map(|chunk| chunk.text.as_str()))
+        {
+            if output.chars().count() >= max_chars {
+                break;
+            }
+            let remaining = max_chars.saturating_sub(output.chars().count());
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.extend(piece.chars().take(remaining));
+        }
+        if output.chars().count() >= max_chars {
+            break;
+        }
+    }
+    output
 }
 
 fn embedding_id(profile_id: &str, input_hash: &str) -> String {
@@ -4252,7 +4472,11 @@ fn resolve_agent_matches(
         .into_iter()
         .filter(|candidate| candidate.name.eq_ignore_ascii_case(&skill.name))
         .collect::<Vec<_>>();
-    (named.len() == 1).then_some(named).unwrap_or_default()
+    if named.len() == 1 {
+        named
+    } else {
+        Vec::new()
+    }
 }
 
 fn physical_agent_matches(
@@ -5121,6 +5345,69 @@ mod tests {
                 .map(|skill| skill.skill_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["skill-codex", "skill-new"]
+        );
+    }
+
+    #[test]
+    fn incremental_semantic_work_retries_missing_or_expired_classifications() {
+        let database = Database::in_memory().unwrap();
+        let profile = test_embedding_profile(
+            "profile-semantic-retry",
+            "openai",
+            "text-embedding-3-small",
+            "1",
+            1536,
+            "credential-openai",
+        );
+        database.upsert_profile(&profile).unwrap();
+        let snapshot = test_canonical_snapshot();
+        database
+            .replace_indexed_skills(&profile.profile_id, &snapshot, 1)
+            .unwrap();
+        for (index, skill) in snapshot.skills.iter().take(2).enumerate() {
+            database
+                .save_skill_classification(&application::SkillClassification {
+                    profile_id: profile.profile_id.clone(),
+                    skill_id: skill.skill_id.clone(),
+                    input_hash: format!("classification-{index}"),
+                    schema_version: CLASSIFICATION_SCHEMA_VERSION.to_string(),
+                    provider: "openai".to_string(),
+                    model: "gpt-test".to_string(),
+                    prompt_version: CLASSIFICATION_PROMPT_VERSION.to_string(),
+                    broad_category: "开发工具".to_string(),
+                    small_categories: vec!["自动化".to_string()],
+                    target_object: "代码".to_string(),
+                    user_goal: "完成开发".to_string(),
+                    capability_summary: "辅助开发".to_string(),
+                    workflow_summary: "分析并执行".to_string(),
+                    confidence: 0.9,
+                    evidence: Vec::new(),
+                    status: if index == 0 {
+                        application::SemanticRecordStatus::Ready
+                    } else {
+                        application::SemanticRecordStatus::Expired
+                    },
+                    error: (index == 1).then(|| "retry".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+
+        let work = incremental_semantic_work_snapshot(
+            &database,
+            &profile.profile_id,
+            &snapshot,
+            "openai",
+            "gpt-test",
+        )
+        .unwrap();
+        assert_eq!(
+            work.skills
+                .iter()
+                .map(|skill| skill.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill-cursor", "skill-shared"]
         );
     }
 
