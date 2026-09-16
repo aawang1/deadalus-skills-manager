@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 type RawProfile = (
     String,
@@ -1905,6 +1905,7 @@ impl Database {
             model: model.to_string(),
             prompt_version: crate::pipeline::CLASSIFICATION_PROMPT_VERSION.to_string(),
             broad_category: String::new(),
+            cluster_category: String::new(),
             small_categories: Vec::new(),
             target_object: String::new(),
             user_goal: String::new(),
@@ -2068,6 +2069,33 @@ impl Database {
             "#,
             params![profile_id, skill_id, error],
         )?;
+        Ok(())
+    }
+
+    pub fn retain_skill_embeddings(
+        &self,
+        profile_id: &str,
+        skill_id: &str,
+        input_hashes: &[String],
+    ) -> DatabaseResult<()> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT embedding_id, input_hash FROM embeddings WHERE profile_id = ?1 AND skill_id = ?2",
+        )?;
+        let existing = statement
+            .query_map(params![profile_id, skill_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (embedding_id, input_hash) in existing {
+            if !input_hashes.contains(&input_hash) {
+                connection.execute(
+                    "DELETE FROM embeddings WHERE embedding_id = ?1",
+                    [embedding_id],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -2562,6 +2590,60 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_vectorization_complexity(&self, level: u8) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            "UPDATE index_settings SET vectorization_complexity = ?1 WHERE singleton_id = 1",
+            [i64::from(level)],
+        )?;
+        Ok(())
+    }
+
+    pub fn vectorization_complexity(&self) -> DatabaseResult<u8> {
+        let value = self.connection()?.query_row(
+            "SELECT vectorization_complexity FROM index_settings WHERE singleton_id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u8::try_from(value).map_err(|_| DatabaseError::InvalidValue {
+            field: "index_settings.vectorization_complexity",
+            value: value.to_string(),
+        })
+    }
+
+    pub fn profile_vectorization_complexity(&self, profile_id: &str) -> DatabaseResult<u8> {
+        let value = self
+            .connection()?
+            .query_row(
+                "SELECT complexity FROM profile_vectorization_settings WHERE profile_id = ?1",
+                [profile_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        u8::try_from(value).map_err(|_| DatabaseError::InvalidValue {
+            field: "profile_vectorization_settings.complexity",
+            value: value.to_string(),
+        })
+    }
+
+    pub fn set_profile_vectorization_complexity(
+        &self,
+        profile_id: &str,
+        level: u8,
+    ) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO profile_vectorization_settings(profile_id, complexity, updated_at)
+            VALUES (?1, ?2, unixepoch())
+            ON CONFLICT(profile_id) DO UPDATE SET
+                complexity = excluded.complexity,
+                updated_at = excluded.updated_at
+            "#,
+            params![profile_id, i64::from(level)],
+        )?;
+        Ok(())
+    }
+
     pub fn ignore_built_in_skills(&self) -> DatabaseResult<bool> {
         self.connection()?
             .query_row(
@@ -2758,10 +2840,10 @@ impl Database {
         pending_changes: u64,
     ) -> DatabaseResult<IndexSyncStatus> {
         let connection = self.connection()?;
-        let (auto_update, ignore_built_in_skills, last_synced_at): (bool, bool, Option<i64>) = connection.query_row(
-            "SELECT auto_update, ignore_built_in_skills, last_synced_at FROM index_settings WHERE singleton_id = 1",
+        let (auto_update, ignore_built_in_skills, vectorization_complexity, last_synced_at): (bool, bool, i64, Option<i64>) = connection.query_row(
+            "SELECT auto_update, ignore_built_in_skills, vectorization_complexity, last_synced_at FROM index_settings WHERE singleton_id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let indexed_skills = if let Some(profile_id) = active_profile_id {
             connection.query_row(
@@ -2775,6 +2857,12 @@ impl Database {
         Ok(IndexSyncStatus {
             auto_update,
             ignore_built_in_skills,
+            vectorization_complexity: u8::try_from(vectorization_complexity).map_err(|_| {
+                DatabaseError::InvalidValue {
+                    field: "index_settings.vectorization_complexity",
+                    value: vectorization_complexity.to_string(),
+                }
+            })?,
             indexed_skills: indexed_skills.max(0) as u64,
             pending_changes,
             last_synced_at,
@@ -3006,6 +3094,125 @@ impl Database {
         }))
     }
 
+    pub fn list_custom_skill_categories(&self) -> DatabaseResult<Vec<CustomSkillCategory>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT category_id, name, color, description, skill_ids_json,
+                   created_at, updated_at
+            FROM custom_skill_categories
+            ORDER BY lower(name), category_id
+            "#,
+        )?;
+        let categories = statement
+            .query_map([], |row| {
+                let skill_ids_json = row.get::<_, String>(4)?;
+                let skill_ids = serde_json::from_str(&skill_ids_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(CustomSkillCategory {
+                    category_id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                    description: row.get(3)?,
+                    skill_ids,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)?;
+        Ok(categories)
+    }
+
+    pub fn custom_skill_category(
+        &self,
+        category_id: &str,
+    ) -> DatabaseResult<Option<CustomSkillCategory>> {
+        self.connection()?
+            .query_row(
+                r#"
+                SELECT category_id, name, color, description, skill_ids_json,
+                       created_at, updated_at
+                FROM custom_skill_categories
+                WHERE category_id = ?1
+                "#,
+                [category_id],
+                |row| {
+                    let skill_ids_json = row.get::<_, String>(4)?;
+                    let skill_ids = serde_json::from_str(&skill_ids_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(CustomSkillCategory {
+                        category_id: row.get(0)?,
+                        name: row.get(1)?,
+                        color: row.get(2)?,
+                        description: row.get(3)?,
+                        skill_ids,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn create_custom_skill_category(
+        &self,
+        category: &CustomSkillCategory,
+    ) -> DatabaseResult<()> {
+        self.connection()?.execute(
+            r#"
+            INSERT INTO custom_skill_categories (
+                category_id, name, color, description, skill_ids_json,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                category.category_id,
+                category.name,
+                category.color,
+                category.description,
+                serde_json::to_string(&category.skill_ids)?,
+                category.created_at,
+                category.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_custom_skill_category(&self, category_id: &str) -> DatabaseResult<bool> {
+        Ok(self.connection()?.execute(
+            "DELETE FROM custom_skill_categories WHERE category_id = ?1",
+            [category_id],
+        )? > 0)
+    }
+
+    pub fn update_custom_skill_category_members(
+        &self,
+        category_id: &str,
+        skill_ids: &[String],
+        updated_at: i64,
+    ) -> DatabaseResult<bool> {
+        Ok(self.connection()?.execute(
+            r#"
+            UPDATE custom_skill_categories
+            SET skill_ids_json = ?2, updated_at = ?3
+            WHERE category_id = ?1
+            "#,
+            params![category_id, serde_json::to_string(skill_ids)?, updated_at],
+        )? > 0)
+    }
+
     #[cfg(test)]
     fn table_names(&self) -> DatabaseResult<Vec<String>> {
         let connection = self.connection()?;
@@ -3129,6 +3336,18 @@ pub struct CanonicalSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct CustomSkillCategory {
+    pub category_id: String,
+    pub name: String,
+    pub color: String,
+    pub description: String,
+    pub skill_ids: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct CanonicalSkill {
     pub skill_id: String,
     pub name: String,
@@ -3219,6 +3438,12 @@ fn migrate(connection: &mut Connection) -> DatabaseResult<()> {
     }
     if version < 7 {
         migration_v7(connection.transaction()?)?;
+    }
+    if version < 8 {
+        migration_v8(connection.transaction()?)?;
+    }
+    if version < 9 {
+        migration_v9(connection.transaction()?)?;
     }
     let final_version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -3790,6 +4015,45 @@ fn migration_v7(transaction: Transaction<'_>) -> DatabaseResult<()> {
     Ok(())
 }
 
+fn migration_v8(transaction: Transaction<'_>) -> DatabaseResult<()> {
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE index_settings ADD COLUMN vectorization_complexity INTEGER NOT NULL DEFAULT 4
+            CHECK (vectorization_complexity BETWEEN 1 AND 4);
+
+        CREATE TABLE profile_vectorization_settings (
+            profile_id TEXT PRIMARY KEY REFERENCES embedding_profiles(profile_id) ON DELETE CASCADE,
+            complexity INTEGER NOT NULL CHECK (complexity BETWEEN 1 AND 4),
+            updated_at INTEGER NOT NULL
+        );
+
+        INSERT INTO schema_version(version, applied_at) VALUES (8, unixepoch());
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migration_v9(transaction: Transaction<'_>) -> DatabaseResult<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE custom_skill_categories (
+            category_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            color TEXT NOT NULL,
+            description TEXT NOT NULL,
+            skill_ids_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        INSERT INTO schema_version(version, applied_at) VALUES (9, unixepoch());
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn profile_from_raw(raw: RawProfile) -> DatabaseResult<EmbeddingProfile> {
     Ok(EmbeddingProfile {
         profile_id: raw.0,
@@ -4047,6 +4311,7 @@ mod tests {
             "cluster_semantics",
             "indexed_skills",
             "index_settings",
+            "custom_skill_categories",
         ] {
             assert!(tables.contains(&expected.to_string()), "missing {expected}");
         }
@@ -4093,6 +4358,57 @@ mod tests {
     }
 
     #[test]
+    fn custom_skill_categories_round_trip_with_stable_membership() {
+        let database = Database::in_memory().unwrap();
+        let category = CustomSkillCategory {
+            category_id: "category-visual".to_string(),
+            name: "视觉工具".to_string(),
+            color: "#4f8cff".to_string(),
+            description: "集中管理视觉 Skills".to_string(),
+            skill_ids: vec!["skill-a".to_string(), "skill-b".to_string()],
+            created_at: 10,
+            updated_at: 10,
+        };
+
+        database.create_custom_skill_category(&category).unwrap();
+        assert_eq!(
+            database.custom_skill_category("category-visual").unwrap(),
+            Some(category.clone())
+        );
+        assert_eq!(
+            database.list_custom_skill_categories().unwrap(),
+            vec![category.clone()]
+        );
+        let expanded_members = vec![
+            "skill-a".to_string(),
+            "skill-b".to_string(),
+            "skill-c".to_string(),
+        ];
+        assert!(database
+            .update_custom_skill_category_members(&category.category_id, &expanded_members, 11,)
+            .unwrap());
+        let expanded = database
+            .custom_skill_category(&category.category_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expanded.skill_ids, expanded_members);
+        assert_eq!(expanded.updated_at, 11);
+        assert!(database
+            .delete_custom_skill_category(&category.category_id)
+            .unwrap());
+        assert_eq!(
+            database
+                .custom_skill_category(&category.category_id)
+                .unwrap(),
+            None
+        );
+        assert!(database.list_custom_skill_categories().unwrap().is_empty());
+        assert!(!database
+            .delete_custom_skill_category(&category.category_id)
+            .unwrap());
+    }
+
+    #[test]
     fn classification_and_cluster_semantics_round_trip_and_failures_become_retryable() {
         let database = Database::in_memory().unwrap();
         database
@@ -4107,6 +4423,7 @@ mod tests {
             model: "model-test".to_string(),
             prompt_version: crate::pipeline::CLASSIFICATION_PROMPT_VERSION.to_string(),
             broad_category: "网页前端开发".to_string(),
+            cluster_category: "组件实现".to_string(),
             small_categories: vec!["组件实现".to_string(), "无障碍".to_string()],
             target_object: "网页界面".to_string(),
             user_goal: "交付一致体验".to_string(),
@@ -4248,6 +4565,32 @@ mod tests {
                 .index_sync_status(None, 0)
                 .unwrap()
                 .ignore_built_in_skills
+        );
+    }
+
+    #[test]
+    fn vectorization_complexity_is_local_and_profile_application_is_separate() {
+        let database = Database::in_memory().unwrap();
+        assert_eq!(database.vectorization_complexity().unwrap(), 4);
+        database.set_vectorization_complexity(2).unwrap();
+        assert_eq!(database.vectorization_complexity().unwrap(), 2);
+
+        let profile = profile("profile-complexity", ProfileStatus::Draft);
+        database.upsert_profile(&profile).unwrap();
+        assert_eq!(
+            database
+                .profile_vectorization_complexity(&profile.profile_id)
+                .unwrap(),
+            0
+        );
+        database
+            .set_profile_vectorization_complexity(&profile.profile_id, 2)
+            .unwrap();
+        assert_eq!(
+            database
+                .profile_vectorization_complexity(&profile.profile_id)
+                .unwrap(),
+            2
         );
     }
 

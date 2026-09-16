@@ -275,8 +275,11 @@ pub struct EmbeddingJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreflightEstimate {
+    pub complexity_level: u8,
     pub skill_count: u64,
     pub file_count: u64,
+    pub analysis_file_count: u64,
+    pub embedding_file_count: u64,
     pub embeddable_text_count: u64,
     pub parent_count: u64,
     pub chunk_count_low: u64,
@@ -285,6 +288,8 @@ pub struct PreflightEstimate {
     pub analysis_tokens_high: u64,
     pub embedding_tokens_low: u64,
     pub embedding_tokens_high: u64,
+    pub estimated_seconds_low: u64,
+    pub estimated_seconds_high: u64,
     pub estimated_cost_low: Option<f64>,
     pub estimated_cost_high: Option<f64>,
     pub provider: String,

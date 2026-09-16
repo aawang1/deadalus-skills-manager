@@ -12,8 +12,11 @@ const request: ProfileChangeRequest = {
 };
 
 const estimate: PreflightEstimate = {
+  complexityLevel: 2,
   skillCount: 2,
   fileCount: 3,
+  analysisFileCount: 2,
+  embeddingFileCount: 2,
   embeddableTextCount: 4,
   parentCount: 5,
   chunkCountLow: 6,
@@ -22,6 +25,8 @@ const estimate: PreflightEstimate = {
   analysisTokensHigh: 12,
   embeddingTokensLow: 20,
   embeddingTokensHigh: 30,
+  estimatedSecondsLow: 12,
+  estimatedSecondsHigh: 90,
   provider: "openai",
   model: "text-embedding-3-small",
   estimatedAt: 1,

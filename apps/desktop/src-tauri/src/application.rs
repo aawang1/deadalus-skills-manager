@@ -138,6 +138,8 @@ pub struct SkillClassification {
     pub model: String,
     pub prompt_version: String,
     pub broad_category: String,
+    #[serde(default)]
+    pub cluster_category: String,
     pub small_categories: Vec<String>,
     pub target_object: String,
     pub user_goal: String,

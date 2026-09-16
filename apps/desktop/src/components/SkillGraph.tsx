@@ -26,6 +26,7 @@ import {
 
 interface SkillGraphProps {
   activeView: ViewId;
+  viewLabel?: string;
   isNative: boolean;
   refreshKey: number;
 }
@@ -58,7 +59,7 @@ type ActiveDrag =
       origin: GraphPoint;
     };
 
-const viewLabels: Record<ViewId, string> = {
+const agentViewLabels = {
   all: "所有 Skills",
   "claude-code": "Claude Code",
   cursor: "Cursor",
@@ -88,9 +89,12 @@ const stateLabels: Record<string, string> = {
 
 export function SkillGraph({
   activeView,
+  viewLabel,
   isNative,
   refreshKey,
 }: SkillGraphProps) {
+  const activeViewLabel =
+    viewLabel ?? agentViewLabels[activeView as keyof typeof agentViewLabels] ?? "自定义类别";
   const [graph, setGraph] = useState<SkillGraphSnapshot>();
   const [state, setState] = useState<"loading" | "ready" | "error">(
     isNative ? "loading" : "ready",
@@ -379,14 +383,14 @@ export function SkillGraph({
   return (
     <section
       className="skill-graph"
-      aria-label={`${viewLabels[activeView]} Skills 关系图`}
+      aria-label={`${activeViewLabel} Skills 关系图`}
     >
       <svg
         ref={svgRef}
         className="skill-graph__canvas"
         viewBox={`0 0 ${graphViewport.width} ${graphViewport.height}`}
         role="img"
-        aria-label={`${viewLabels[activeView]} Skills 径向关系图`}
+        aria-label={`${activeViewLabel} Skills 径向关系图`}
         onWheel={onWheel}
         onPointerDown={beginCanvasDrag}
         onPointerMove={moveDrag}

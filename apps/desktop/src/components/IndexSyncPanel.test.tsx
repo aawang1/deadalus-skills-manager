@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EmbeddingJob } from "../types";
@@ -11,7 +11,9 @@ const mocks = vi.hoisted(() => ({
   deleteEmbeddingJobHistory: vi.fn(),
   clearEmbeddingJobHistory: vi.fn(),
   setIgnoreBuiltInSkills: vi.fn(),
+  setVectorizationComplexity: vi.fn(),
   scanEmbeddingChanges: vi.fn(),
+  beginIncrementalPreflight: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
@@ -41,11 +43,13 @@ const runningJob: EmbeddingJob = {
 
 describe("IndexSyncPanel Jobs history", () => {
   beforeEach(() => {
-    mocks.getIndexSyncStatus.mockResolvedValue({ autoUpdate: false, ignoreBuiltInSkills: false, indexedSkills: 2, pendingChanges: 0 });
+    mocks.getIndexSyncStatus.mockResolvedValue({ autoUpdate: false, ignoreBuiltInSkills: false, vectorizationComplexity: 4, indexedSkills: 2, pendingChanges: 0 });
     mocks.getIndexDiff.mockResolvedValue({ added: 0, changed: 0, removed: 0, unchanged: 2 });
     mocks.listEmbeddingJobs.mockResolvedValue([completedJob, runningJob]);
     mocks.deleteEmbeddingJobHistory.mockResolvedValue(true);
     mocks.clearEmbeddingJobHistory.mockResolvedValue(1);
+    mocks.setVectorizationComplexity.mockResolvedValue({ autoUpdate: false, ignoreBuiltInSkills: false, vectorizationComplexity: 2, indexedSkills: 2, pendingChanges: 2 });
+    mocks.beginIncrementalPreflight.mockResolvedValue({ complexityLevel: 2, skillCount: 1 });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
@@ -69,5 +73,30 @@ describe("IndexSyncPanel Jobs history", () => {
     expect(mocks.clearEmbeddingJobHistory).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: "取消" })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "清空历史" })).toBeDisabled());
+  });
+
+  it("persists the selected processing depth and refreshes the effective diff", async () => {
+    render(<IndexSyncPanel isNative activeProfileId="profile-a" profiles={[]} onEstimate={vi.fn()} refreshVersion={0} notify={vi.fn()} />);
+
+    const slider = await screen.findByRole("slider", { name: "向量化处理深度" });
+    fireEvent.change(slider, { target: { value: "2" } });
+
+    await waitFor(() => expect(mocks.setVectorizationComplexity).toHaveBeenCalledWith(2));
+    expect(mocks.getIndexDiff).toHaveBeenCalled();
+  });
+
+  it("opens the shared preflight before starting an incremental update", async () => {
+    const user = userEvent.setup();
+    const onEstimate = vi.fn();
+    mocks.getIndexDiff.mockResolvedValueOnce({ added: 1, changed: 0, removed: 0, unchanged: 1 });
+    render(<IndexSyncPanel isNative activeProfileId="profile-a" profiles={[]} onEstimate={onEstimate} refreshVersion={0} notify={vi.fn()} />);
+
+    await user.click(await screen.findByRole("button", { name: "应用增量" }));
+
+    expect(mocks.beginIncrementalPreflight).toHaveBeenCalledWith("profile-a");
+    await waitFor(() => expect(onEstimate).toHaveBeenCalledWith(
+      expect.objectContaining({ complexityLevel: 2 }),
+      { strategy: "incremental", profileId: "profile-a" },
+    ));
   });
 });

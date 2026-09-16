@@ -3,8 +3,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AdaptiveHistoryRecord,
   AdaptivePolicyState,
+  AddSkillsToCustomCategoryResult,
   ApiKeyMetadata,
   CanonicalSnapshot,
+  CreateCustomSkillCategoryRequest,
+  CustomSkillCategory,
   CreateEmbeddingProfileRequest,
   CredentialPurpose,
   EmbeddingJob,
@@ -22,6 +25,7 @@ import type {
   ProfileChangeRequest,
   ProgressEvent,
   ProviderModelsResponse,
+  ReplaceCustomCategoryMembersResult,
   SemanticSearchResult,
   SearchPreferences,
   SkillActionPlan,
@@ -52,6 +56,22 @@ export const api = {
     invoke<CanonicalSnapshot>("restore_skill_backup", { skillId }),
   copyLibrarySkillToAgent: (skillPath: string, agent: string) =>
     invoke<void>("copy_library_skill_to_agent", { skillPath, agent }),
+  listCustomSkillCategories: () =>
+    invoke<CustomSkillCategory[]>("list_custom_skill_categories"),
+  createCustomSkillCategory: (request: CreateCustomSkillCategoryRequest) =>
+    invoke<CustomSkillCategory>("create_custom_skill_category", { request }),
+  deleteCustomSkillCategory: (categoryId: string) =>
+    invoke<boolean>("delete_custom_skill_category", { categoryId }),
+  addSkillsToCustomCategory: (categoryId: string, skillIds: string[]) =>
+    invoke<AddSkillsToCustomCategoryResult>("add_skills_to_custom_category", {
+      categoryId,
+      skillIds,
+    }),
+  replaceCustomCategoryMembers: (sourceCategoryId: string, targetCategoryId: string) =>
+    invoke<ReplaceCustomCategoryMembersResult>("replace_custom_category_members", {
+      sourceCategoryId,
+      targetCategoryId,
+    }),
 
   listApiKeys: () => invoke<ApiKeyMetadata[]>("list_api_keys"),
   saveApiKey: (provider: string, apiKey: string) =>
@@ -115,11 +135,15 @@ export const api = {
     invoke<IndexSyncStatus>("set_index_auto_update", { enabled }),
   setIgnoreBuiltInSkills: (enabled: boolean) =>
     invoke<IndexSyncStatus>("set_ignore_built_in_skills", { enabled }),
+  setVectorizationComplexity: (level: 1 | 2 | 3 | 4) =>
+    invoke<IndexSyncStatus>("set_vectorization_complexity", { level }),
   scanEmbeddingChanges: () =>
     invoke<IndexDiff>("scan_embedding_changes"),
   getIndexDiff: () => invoke<IndexDiff>("get_index_diff"),
   beginFullRebuildPreflight: (profileId?: string) =>
     invoke<PreflightEstimate>("begin_full_rebuild_preflight", { profileId }),
+  beginIncrementalPreflight: (profileId?: string) =>
+    invoke<PreflightEstimate>("begin_incremental_preflight", { profileId }),
   listEmbeddingJobs: () => invoke<EmbeddingJob[]>("list_embedding_jobs"),
   deleteEmbeddingJobHistory: (jobId: string) =>
     invoke<boolean>("delete_embedding_job_history", { jobId }),

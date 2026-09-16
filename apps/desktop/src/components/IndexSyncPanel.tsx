@@ -15,7 +15,7 @@ interface IndexSyncPanelProps {
   onEstimate: (
     estimate: PreflightEstimate,
     execution?: {
-      strategy: "full_rebuild" | "profile_migration";
+      strategy: "incremental" | "full_rebuild" | "profile_migration";
       profileId?: string;
     },
   ) => void;
@@ -122,22 +122,12 @@ export function IndexSyncPanel({
 
   const applyIncremental = async () => {
     if (!activeProfileId || !diff) return;
-    if (
-      !window.confirm(
-        `确认应用增量更新吗？新增 ${diff.added}、修改 ${diff.changed}、删除 ${diff.removed}。`,
-      )
-    ) {
-      return;
-    }
     setBusy("incremental");
     try {
-      const job = await api.startEmbeddingJob(
-        "incremental",
-        undefined,
-        activeProfileId,
-      );
-      setJobs((current) => [job, ...current]);
-      notify("success", "增量更新任务已启动。");
+      onEstimate(await api.beginIncrementalPreflight(activeProfileId), {
+        strategy: "incremental",
+        profileId: activeProfileId,
+      });
     } catch (error) {
       unavailable(error);
     } finally {
@@ -152,6 +142,24 @@ export function IndexSyncPanel({
       notify("info", "已请求取消任务。");
     } catch (error) {
       unavailable(error);
+    }
+  };
+
+  const changeComplexity = async (level: 1 | 2 | 3 | 4) => {
+    if (!status || level === status.vectorizationComplexity) return;
+    setBusy("complexity");
+    try {
+      const next = await api.setVectorizationComplexity(level);
+      setStatus(next);
+      setDiff(await api.getIndexDiff());
+      notify(
+        "success",
+        `处理深度已切换为 ${complexityLevels[level - 1].label}；后续增量与全量任务使用此档位。`,
+      );
+    } catch (error) {
+      unavailable(error);
+    } finally {
+      setBusy(undefined);
     }
   };
 
@@ -288,6 +296,37 @@ export function IndexSyncPanel({
             </button>
             <span>忽略内置 Skills</span>
           </label>
+          <div className="complexity-control">
+            <div className="complexity-control__label">
+              <span>处理深度</span>
+              <strong>
+                {complexityLevels[(status?.vectorizationComplexity ?? 4) - 1].label}
+              </strong>
+            </div>
+            <input
+              className={`complexity-control__range complexity-control__range--${status?.vectorizationComplexity ?? 4}`}
+              type="range"
+              min="1"
+              max="4"
+              step="1"
+              value={status?.vectorizationComplexity ?? 4}
+              disabled={disabled || !status || busy != null}
+              aria-label="向量化处理深度"
+              aria-valuetext={complexityLevels[(status?.vectorizationComplexity ?? 4) - 1].label}
+              onChange={(event) =>
+                changeComplexity(
+                  Number(event.currentTarget.value) as 1 | 2 | 3 | 4,
+                )
+              }
+            />
+            <div className="complexity-control__marks" aria-hidden="true">
+              {complexityLevels.map((item) => (
+                <span key={item.level} data-tooltip={item.detail}>
+                  {item.level}
+                </span>
+              ))}
+            </div>
+          </div>
           <button
             type="button"
             disabled={disabled || busy != null}
@@ -361,6 +400,13 @@ export function IndexSyncPanel({
     </div>
   );
 }
+
+const complexityLevels = [
+  { level: 1 as const, label: "核心", detail: "LLM、结构分析与 Embedding 仅读取核心 SKILL.md；Overall Function 使用规则生成内容。" },
+  { level: 2 as const, label: "摘要", detail: "扫描范围仍仅为 SKILL.md，并使用最终 LLM 分类摘要重新生成 Overall Function 向量。" },
+  { level: 3 as const, label: "全量向量", detail: "LLM 与结构分析仅读取 SKILL.md；Embedding 扩展到 Skill 包内全部可嵌入文件。" },
+  { level: 4 as const, label: "完整", detail: "LLM、结构分析与 Embedding 均读取 Skill 包内全部可嵌入文件，耗时与 Token 最高。" },
+];
 
 function isFinishedJob(status: EmbeddingJob["status"]) {
   return ["completed", "failed", "cancelled"].includes(status);

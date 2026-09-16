@@ -1,5 +1,6 @@
 export type AgentId = "claude-code" | "cursor" | "codex";
-export type ViewId = "all" | AgentId;
+export type CustomCategoryViewId = `custom:${string}`;
+export type ViewId = "all" | AgentId | CustomCategoryViewId;
 export type ProviderId = "anthropic" | "openai" | "deepseek" | "qwen";
 export type CredentialPurpose = "agent" | "embedding";
 
@@ -73,6 +74,36 @@ export interface CanonicalSnapshot {
   searchedPaths: string[];
   warnings: string[];
   skills: InstalledSkill[];
+}
+
+export interface CustomSkillCategory {
+  categoryId: string;
+  name: string;
+  color: string;
+  description: string;
+  skillIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateCustomSkillCategoryRequest {
+  name: string;
+  color: string;
+  description: string;
+  skillIds: string[];
+}
+
+export interface AddSkillsToCustomCategoryResult {
+  category: CustomSkillCategory;
+  addedCount: number;
+  skippedCount: number;
+}
+
+export interface ReplaceCustomCategoryMembersResult {
+  category: CustomSkillCategory;
+  addedCount: number;
+  removedCount: number;
+  unchangedCount: number;
 }
 
 export type ProfileStatus =
@@ -161,8 +192,11 @@ export interface EmbeddingProfileSettings {
 }
 
 export interface PreflightEstimate {
+  complexityLevel: 1 | 2 | 3 | 4;
   skillCount: number;
   fileCount: number;
+  analysisFileCount: number;
+  embeddingFileCount: number;
   embeddableTextCount: number;
   parentCount: number;
   chunkCountLow: number;
@@ -171,6 +205,8 @@ export interface PreflightEstimate {
   analysisTokensHigh: number;
   embeddingTokensLow: number;
   embeddingTokensHigh: number;
+  estimatedSecondsLow: number;
+  estimatedSecondsHigh: number;
   estimatedCostLow?: number;
   estimatedCostHigh?: number;
   provider: string;
@@ -200,6 +236,7 @@ export interface EmbeddingJob {
 export interface IndexSyncStatus {
   autoUpdate: boolean;
   ignoreBuiltInSkills: boolean;
+  vectorizationComplexity: 1 | 2 | 3 | 4;
   indexedSkills: number;
   pendingChanges: number;
   lastSyncedAt?: number;
@@ -325,6 +362,8 @@ export interface SkillGraphNode {
   path: string;
   enabledAgents: AgentId[];
   clusterId?: string;
+  broadCategory: string;
+  clusterCategory: string;
   centrality: number;
   superseded: boolean;
   disabled: boolean;

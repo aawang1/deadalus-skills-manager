@@ -32,17 +32,17 @@ use application::{
 };
 use database::{
     AdaptiveHistoryRecord, AgentSkillState, CanonicalFile, CanonicalSkill, CanonicalSnapshot,
-    Database, FeedbackEventRecord, LocalValidationMutation, ValidationRunRecord,
-    ValidationSampleRecord,
+    CustomSkillCategory, Database, FeedbackEventRecord, LocalValidationMutation,
+    ValidationRunRecord, ValidationSampleRecord,
 };
 use graph::{build_classified_skill_graph, cluster_member_hash, empty_graph, SkillGraphSnapshot};
 use pipeline::{
-    compare_analysis, estimate_preflight, prepare_skill_inputs, rule_result,
-    ClusterSemanticRequest, EmbeddingJobContext, EmbeddingProvider, IndexDiff, IndexSyncStatus,
-    JobStrategy, PreparedProfileChange, ProfileChangeRequest, ProgressEvent,
-    RemoteAnalysisProvider, RemoteEmbeddingProvider, ReqwestJsonTransport,
-    SkillClassificationRequest, ToastMessage, CLASSIFICATION_PROMPT_VERSION,
-    CLASSIFICATION_SCHEMA_VERSION,
+    compare_analysis, estimate_preflight_with_complexity, prepare_skill_inputs_with_scope,
+    replace_overall_function_with_classification_summary, rule_result, ClusterSemanticRequest,
+    EmbeddingJobContext, EmbeddingProvider, IndexDiff, IndexSyncStatus, JobStrategy,
+    PreparedProfileChange, ProfileChangeRequest, ProgressEvent, RemoteAnalysisProvider,
+    RemoteEmbeddingProvider, ReqwestJsonTransport, SkillClassificationRequest, ToastMessage,
+    VectorizationComplexity, CLASSIFICATION_PROMPT_VERSION, CLASSIFICATION_SCHEMA_VERSION,
 };
 use validation::{
     compute_metrics, generate_samples, split_for_family, EvaluatedSample, FeedbackAction,
@@ -207,6 +207,32 @@ struct AgentSkillsResponse {
     searched_paths: Vec<String>,
     skills: Vec<InstalledSkill>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCustomSkillCategoryRequest {
+    name: String,
+    color: String,
+    description: String,
+    skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddSkillsToCustomCategoryResult {
+    category: CustomSkillCategory,
+    added_count: usize,
+    skipped_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceCustomCategoryMembersResult {
+    category: CustomSkillCategory,
+    added_count: usize,
+    removed_count: usize,
+    unchanged_count: usize,
 }
 
 struct LibraryWatcher {
@@ -1160,6 +1186,15 @@ fn emit_preflight(app: &AppHandle, estimate: &vectorization::PreflightEstimate) 
     let _ = app.emit("embedding-preflight-estimate", estimate);
 }
 
+fn selected_vectorization_complexity(
+    database: &Database,
+) -> Result<VectorizationComplexity, String> {
+    let level = database
+        .vectorization_complexity()
+        .map_err(|error| format!("无法读取向量化复杂度：{error}"))?;
+    VectorizationComplexity::from_level(level)
+}
+
 #[tauri::command]
 fn prepare_profile_change(
     app: AppHandle,
@@ -1169,7 +1204,11 @@ fn prepare_profile_change(
     let profile = preflight_profile_for_request(database.inner(), &request)?;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
     let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
-    let estimate = estimate_preflight(&snapshot, &profile);
+    let estimate = estimate_preflight_with_complexity(
+        &snapshot,
+        &profile,
+        selected_vectorization_complexity(database.inner())?,
+    );
     let source = request
         .source_profile_id
         .as_deref()
@@ -1203,7 +1242,11 @@ fn profile_change_preflight(
     let profile = preflight_profile_for_request(database, request)?;
     let snapshot = current_snapshot_for_contract(app, database)?;
     let snapshot = snapshot_for_embedding(database, &snapshot)?;
-    let estimate = estimate_preflight(&snapshot, &profile);
+    let estimate = estimate_preflight_with_complexity(
+        &snapshot,
+        &profile,
+        selected_vectorization_complexity(database)?,
+    );
     emit_preflight(app, &estimate);
     Ok(estimate)
 }
@@ -1245,7 +1288,47 @@ fn begin_full_rebuild_preflight(
     };
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
     let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
-    let estimate = estimate_preflight(&snapshot, &profile);
+    let estimate = estimate_preflight_with_complexity(
+        &snapshot,
+        &profile,
+        selected_vectorization_complexity(database.inner())?,
+    );
+    emit_preflight(&app, &estimate);
+    Ok(estimate)
+}
+
+#[tauri::command]
+fn begin_incremental_preflight(
+    app: AppHandle,
+    database: State<'_, Database>,
+    profile_id: Option<String>,
+) -> Result<vectorization::PreflightEstimate, String> {
+    let profile = if let Some(profile_id) = profile_id {
+        database
+            .profile(&profile_id)
+            .map_err(|error| format!("无法读取 Profile：{error}"))?
+            .ok_or_else(|| "未找到 Embedding Profile".to_string())?
+    } else {
+        database
+            .active_profile()
+            .map_err(|error| format!("无法读取活动 Profile：{error}"))?
+            .ok_or_else(|| "当前没有活动 Embedding Profile".to_string())?
+    };
+    let analysis_provider = active_analysis_provider(&app)?;
+    let snapshot = current_snapshot_for_contract(&app, database.inner())?;
+    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
+    let work = incremental_semantic_work_snapshot(
+        database.inner(),
+        &profile.profile_id,
+        &snapshot,
+        &analysis_provider.provider,
+        &analysis_provider.model,
+    )?;
+    let estimate = estimate_preflight_with_complexity(
+        &work,
+        &profile,
+        selected_vectorization_complexity(database.inner())?,
+    );
     emit_preflight(&app, &estimate);
     Ok(estimate)
 }
@@ -1257,7 +1340,7 @@ fn diff_for_active_profile(
     let active = database
         .active_profile()
         .map_err(|error| format!("无法读取活动 Profile：{error}"))?;
-    let diff = if let Some(profile) = &active {
+    let mut diff = if let Some(profile) = &active {
         database
             .compute_index_diff(&profile.profile_id, snapshot)
             .map_err(|error| format!("无法计算索引差异：{error}"))?
@@ -1273,6 +1356,18 @@ fn diff_for_active_profile(
             unchanged: 0,
         }
     };
+    if let Some(profile) = &active {
+        let selected = database
+            .vectorization_complexity()
+            .map_err(|error| format!("无法读取向量化复杂度：{error}"))?;
+        let applied = database
+            .profile_vectorization_complexity(&profile.profile_id)
+            .map_err(|error| format!("无法读取 Profile 向量化复杂度：{error}"))?;
+        if selected != applied {
+            diff.changed = diff.changed.saturating_add(diff.unchanged);
+            diff.unchanged = 0;
+        }
+    }
     Ok((active, diff))
 }
 
@@ -1312,6 +1407,18 @@ fn incremental_work_snapshot(
     profile_id: &str,
     snapshot: &CanonicalSnapshot,
 ) -> Result<CanonicalSnapshot, String> {
+    let selected_complexity = database
+        .vectorization_complexity()
+        .map_err(|error| format!("无法读取向量化复杂度：{error}"))?;
+    let applied_complexity = database
+        .profile_vectorization_complexity(profile_id)
+        .map_err(|error| format!("无法读取 Profile 向量化复杂度：{error}"))?;
+    if selected_complexity != applied_complexity {
+        let mut work = snapshot.clone();
+        work.skills
+            .retain(|skill| !skill.path.starts_with("bundled://"));
+        return Ok(work);
+    }
     let unchanged = database
         .unchanged_indexed_skill_ids(profile_id, snapshot)
         .map_err(|error| format!("无法读取已复用 Skills：{error}"))?;
@@ -1378,6 +1485,9 @@ fn get_index_sync_status(
     let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let (active, diff) = diff_for_active_profile(database.inner(), &snapshot)?;
     database
+        .save_index_diff(&diff)
+        .map_err(|error| format!("无法保存索引差异：{error}"))?;
+    database
         .index_sync_status(
             active.as_ref().map(|profile| profile.profile_id.as_str()),
             diff.added + diff.changed + diff.removed,
@@ -1407,6 +1517,20 @@ fn set_ignore_built_in_skills(
         .set_ignore_built_in_skills(enabled)
         .map_err(|error| format!("无法保存内置 Skills 设置：{error}"))?;
     get_index_sync_status(app, database)
+}
+
+#[tauri::command]
+fn set_vectorization_complexity(
+    app: AppHandle,
+    database: State<'_, Database>,
+    level: u8,
+) -> Result<IndexSyncStatus, String> {
+    VectorizationComplexity::from_level(level)?;
+    database
+        .set_vectorization_complexity(level)
+        .map_err(|error| format!("无法保存向量化复杂度：{error}"))?;
+    let status = get_index_sync_status(app, database)?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1712,6 +1836,7 @@ fn start_embedding_job(
     // Validate the active Agent credential before creating an asynchronous Job,
     // so a missing key is reported immediately rather than as a delayed failure.
     let analysis_provider = active_analysis_provider(&app)?;
+    let vectorization_complexity = selected_vectorization_complexity(database.inner())?;
     let snapshot = current_snapshot_for_contract(&app, database.inner())?;
     let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
     let estimate_snapshot = if strategy == JobStrategy::Incremental {
@@ -1725,7 +1850,8 @@ fn start_embedding_job(
     } else {
         snapshot.clone()
     };
-    let estimate = estimate_preflight(&estimate_snapshot, &profile);
+    let estimate =
+        estimate_preflight_with_complexity(&estimate_snapshot, &profile, vectorization_complexity);
     let job = EmbeddingJob {
         job_id: Uuid::new_v4().to_string(),
         profile_id: profile.profile_id.clone(),
@@ -1751,6 +1877,7 @@ fn start_embedding_job(
         activate_on_success: strategy != JobStrategy::Incremental,
         staged_profile: staged.staged_profile,
         adaptive_policy,
+        vectorization_complexity: vectorization_complexity.level(),
     };
     database
         .save_job_context(
@@ -1870,11 +1997,198 @@ fn list_skill_relations(
 }
 
 #[tauri::command]
+fn list_custom_skill_categories(
+    database: State<'_, Database>,
+) -> Result<Vec<CustomSkillCategory>, String> {
+    database
+        .list_custom_skill_categories()
+        .map_err(|error| format!("无法读取自定义类别：{error}"))
+}
+
+#[tauri::command]
+fn create_custom_skill_category(
+    database: State<'_, Database>,
+    request: CreateCustomSkillCategoryRequest,
+) -> Result<CustomSkillCategory, String> {
+    const ALLOWED_COLORS: [&str; 8] = [
+        "#4f8cff", "#8b7cff", "#de6ea8", "#ef795f", "#e0b44f", "#57bd87", "#45b9c7", "#a7b0bf",
+    ];
+    let name = request.name.trim();
+    let description = request.description.trim();
+    if name.is_empty() || name.chars().count() > 48 {
+        return Err("类别名称必须为 1–48 个字符。".to_string());
+    }
+    if description.is_empty() || description.chars().count() > 500 {
+        return Err("类别简介必须为 1–500 个字符。".to_string());
+    }
+    if !ALLOWED_COLORS.contains(&request.color.as_str()) {
+        return Err("类别标志颜色无效。".to_string());
+    }
+
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "尚无可用的 Skills 快照。".to_string())?;
+    let available = snapshot
+        .skills
+        .iter()
+        .filter(|skill| !skill.is_built_in)
+        .map(|skill| skill.skill_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut skill_ids = request
+        .skill_ids
+        .into_iter()
+        .filter(|skill_id| available.contains(skill_id.as_str()))
+        .collect::<Vec<_>>();
+    skill_ids.sort();
+    skill_ids.dedup();
+    if skill_ids.is_empty() {
+        return Err("请至少选择一个当前存在的 Skill。".to_string());
+    }
+
+    let now = unix_timestamp_i64()?;
+    let category = CustomSkillCategory {
+        category_id: format!("category_{}", Uuid::new_v4().simple()),
+        name: name.to_string(),
+        color: request.color,
+        description: description.to_string(),
+        skill_ids,
+        created_at: now,
+        updated_at: now,
+    };
+    database
+        .create_custom_skill_category(&category)
+        .map_err(|error| format!("无法创建自定义类别：{error}"))?;
+    Ok(category)
+}
+
+#[tauri::command]
+fn delete_custom_skill_category(
+    database: State<'_, Database>,
+    category_id: String,
+) -> Result<bool, String> {
+    if category_id.trim().is_empty() {
+        return Err("自定义类别标识不能为空。".to_string());
+    }
+    database
+        .delete_custom_skill_category(&category_id)
+        .map_err(|error| format!("无法删除自定义类别：{error}"))
+}
+
+#[tauri::command]
+fn add_skills_to_custom_category(
+    database: State<'_, Database>,
+    category_id: String,
+    skill_ids: Vec<String>,
+) -> Result<AddSkillsToCustomCategoryResult, String> {
+    let mut category = database
+        .custom_skill_category(&category_id)
+        .map_err(|error| format!("无法读取目标类别：{error}"))?
+        .ok_or_else(|| format!("目标类别不存在：{category_id}"))?;
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "尚无可用的 Skills 快照。".to_string())?;
+    let eligible_ids = snapshot
+        .skills
+        .iter()
+        .filter(|skill| !skill.is_built_in)
+        .map(|skill| skill.skill_id.as_str())
+        .collect::<HashSet<_>>();
+    let requested_count = skill_ids.len();
+    let mut members = category.skill_ids.iter().cloned().collect::<HashSet<_>>();
+    let before = members.len();
+    for skill_id in skill_ids {
+        if eligible_ids.contains(skill_id.as_str()) {
+            members.insert(skill_id);
+        }
+    }
+    let mut merged = members.into_iter().collect::<Vec<_>>();
+    merged.sort();
+    let added_count = merged.len().saturating_sub(before);
+    let skipped_count = requested_count.saturating_sub(added_count);
+    let updated_at = unix_timestamp_i64()?;
+    if added_count > 0 {
+        let updated = database
+            .update_custom_skill_category_members(&category_id, &merged, updated_at)
+            .map_err(|error| format!("无法更新目标类别：{error}"))?;
+        if !updated {
+            return Err(format!("目标类别不存在：{category_id}"));
+        }
+        category.skill_ids = merged;
+        category.updated_at = updated_at;
+    }
+    Ok(AddSkillsToCustomCategoryResult {
+        category,
+        added_count,
+        skipped_count,
+    })
+}
+
+#[tauri::command]
+fn replace_custom_category_members(
+    database: State<'_, Database>,
+    source_category_id: String,
+    target_category_id: String,
+) -> Result<ReplaceCustomCategoryMembersResult, String> {
+    if source_category_id == target_category_id {
+        return Err("源类别和目标类别不能相同。".to_string());
+    }
+    let source = database
+        .custom_skill_category(&source_category_id)
+        .map_err(|error| format!("无法读取源类别：{error}"))?
+        .ok_or_else(|| format!("源类别不存在：{source_category_id}"))?;
+    let mut target = database
+        .custom_skill_category(&target_category_id)
+        .map_err(|error| format!("无法读取目标类别：{error}"))?
+        .ok_or_else(|| format!("目标类别不存在：{target_category_id}"))?;
+
+    let source_members = source.skill_ids.into_iter().collect::<HashSet<_>>();
+    let target_members = target.skill_ids.iter().cloned().collect::<HashSet<_>>();
+    let added_count = source_members.difference(&target_members).count();
+    let removed_count = target_members.difference(&source_members).count();
+    let unchanged_count = source_members.intersection(&target_members).count();
+    let mut replacement = source_members.into_iter().collect::<Vec<_>>();
+    replacement.sort();
+
+    if target.skill_ids != replacement {
+        let updated_at = unix_timestamp_i64()?;
+        let updated = database
+            .update_custom_skill_category_members(&target_category_id, &replacement, updated_at)
+            .map_err(|error| format!("无法覆盖目标类别：{error}"))?;
+        if !updated {
+            return Err(format!("目标类别不存在：{target_category_id}"));
+        }
+        target.skill_ids = replacement;
+        target.updated_at = updated_at;
+    }
+
+    Ok(ReplaceCustomCategoryMembersResult {
+        category: target,
+        added_count,
+        removed_count,
+        unchanged_count,
+    })
+}
+
+#[tauri::command]
 fn get_skill_graph(
     database: State<'_, Database>,
     view_id: String,
 ) -> Result<SkillGraphSnapshot, String> {
-    if !matches!(view_id.as_str(), "all" | "claude-code" | "cursor" | "codex") {
+    let custom_category = if let Some(category_id) = view_id.strip_prefix("custom:") {
+        Some(
+            database
+                .custom_skill_category(category_id)
+                .map_err(|error| format!("无法读取自定义类别：{error}"))?
+                .ok_or_else(|| format!("自定义类别不存在：{category_id}"))?,
+        )
+    } else {
+        None
+    };
+    if custom_category.is_none()
+        && !matches!(view_id.as_str(), "all" | "claude-code" | "cursor" | "codex")
+    {
         return Err(format!("未知 Skills 分类：{view_id}"));
     }
     let Some(profile) = database
@@ -1896,7 +2210,13 @@ fn get_skill_graph(
         graph.layout_version = graph.graph_version.clone();
         return Ok(graph);
     };
-    let snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
+    let mut snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
+    if let Some(category) = &custom_category {
+        let member_ids = category.skill_ids.iter().collect::<HashSet<_>>();
+        snapshot
+            .skills
+            .retain(|skill| member_ids.contains(&skill.skill_id));
+    }
     let vectors = database
         .load_vectors(&profile.profile_id)
         .map_err(|error| format!("无法读取活动 Profile 向量：{error}"))?;
@@ -2587,6 +2907,8 @@ async fn run_embedding_job_inner(
             .max(1),
         ..Default::default()
     };
+    let vectorization_complexity =
+        VectorizationComplexity::from_level(context.vectorization_complexity)?;
 
     for skill in work_snapshot
         .skills
@@ -2615,17 +2937,24 @@ async fn run_embedding_job_inner(
             emit_toast(app, "info", "Embedding Job 已取消");
             return Ok(());
         }
-        let prepared = prepare_skill_inputs(skill, &input_config)?;
-        database
-            .save_generated_inputs(
-                &snapshot.snapshot_id,
-                &skill.skill_id,
-                &prepared.inputs,
-                unix_timestamp_i64()?,
-            )
-            .map_err(|error| error.to_string())?;
+        let analysis_prepared = prepare_skill_inputs_with_scope(
+            skill,
+            &input_config,
+            vectorization_complexity.analysis_scope(),
+        )?;
+        let mut prepared = if vectorization_complexity.analysis_scope()
+            == vectorization_complexity.embedding_scope()
+        {
+            analysis_prepared.clone()
+        } else {
+            prepare_skill_inputs_with_scope(
+                skill,
+                &input_config,
+                vectorization_complexity.embedding_scope(),
+            )?
+        };
 
-        let rule = rule_result(&skill.skill_id, &prepared.inputs);
+        let rule = rule_result(&skill.skill_id, &analysis_prepared.inputs);
         let analysis_cached = database
             .has_analysis_for_input(&skill.skill_id, &rule.input_hash, true)
             .map_err(|error| error.to_string())?;
@@ -2633,7 +2962,7 @@ async fn run_embedding_job_inner(
             // Deterministic inputs and the requested analysis tier are already
             // available. Reuse them without another remote LLM call.
         } else {
-            let markdown = prepared
+            let markdown = analysis_prepared
                 .inputs
                 .iter()
                 .map(|input| input.text.as_str())
@@ -2694,7 +3023,7 @@ async fn run_embedding_job_inner(
                 skill_name: skill.name.clone(),
                 skill_description: skill.description.clone(),
                 structured_rule_fields: rule.fields.clone(),
-                content: classification_content(&prepared.inputs, 24_000),
+                content: classification_content(&analysis_prepared.inputs, 2_000_000),
             };
             let classified = match analysis_provider.classify_skill(&request).await {
                 Ok(classified) => classified,
@@ -2742,6 +3071,27 @@ async fn run_embedding_job_inner(
                 .save_skill_classification(&classification)
                 .map_err(|error| error.to_string())?;
         }
+        let classification = database
+            .skill_classification(&profile.profile_id, &skill.skill_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Skill 分类结果不存在：{}", skill.skill_id))?;
+        if vectorization_complexity.uses_classification_overall() {
+            replace_overall_function_with_classification_summary(
+                &mut prepared.inputs,
+                &format!("{}/SKILL.md", skill.skill_id),
+                &skill.name,
+                &classification,
+                &input_config,
+            );
+        }
+        database
+            .save_generated_inputs(
+                &snapshot.snapshot_id,
+                &skill.skill_id,
+                &prepared.inputs,
+                unix_timestamp_i64()?,
+            )
+            .map_err(|error| error.to_string())?;
         completed += 1;
 
         let mut pending = Vec::new();
@@ -2826,6 +3176,17 @@ async fn run_embedding_job_inner(
                 }
             }
         }
+        let current_input_hashes = prepared
+            .inputs
+            .iter()
+            .flat_map(|input| {
+                std::iter::once(input.input_hash.clone())
+                    .chain(input.chunks.iter().map(|chunk| chunk.input_hash.clone()))
+            })
+            .collect::<Vec<_>>();
+        database
+            .retain_skill_embeddings(&profile.profile_id, &skill.skill_id, &current_input_hashes)
+            .map_err(|error| error.to_string())?;
         database
             .update_job(
                 &job.job_id,
@@ -2838,9 +3199,36 @@ async fn run_embedding_job_inner(
             .map_err(|error| error.to_string())?;
         emit_progress(app, job, completed);
     }
-    let classifications = database
+    let mut classifications = database
         .classifications_for_profile(&profile.profile_id)
         .map_err(|error| error.to_string())?;
+    if classifications.iter().any(|classification| {
+        classification.status == application::SemanticRecordStatus::Ready
+            && classification.cluster_category.trim().is_empty()
+    }) {
+        let assignments = analysis_provider
+            .normalize_skill_taxonomy(&classifications)
+            .await
+            .map_err(|error| format!("Skill 层级类别规范化失败，任务已停止：{error}"))?;
+        let assignments = assignments
+            .into_iter()
+            .map(|item| (item.skill_id.clone(), item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let normalized_at = unix_timestamp_i64()?;
+        for classification in classifications.iter_mut().filter(|classification| {
+            classification.status == application::SemanticRecordStatus::Ready
+        }) {
+            let assignment = assignments.get(&classification.skill_id).ok_or_else(|| {
+                format!("Skill 层级类别规范化缺少结果：{}", classification.skill_id)
+            })?;
+            classification.broad_category = assignment.level_one_category.clone();
+            classification.cluster_category = assignment.level_two_category.clone();
+            classification.updated_at = normalized_at;
+            database
+                .save_skill_classification(classification)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     let current_vectors = database
         .load_vectors(&profile.profile_id)
         .map_err(|error| error.to_string())?;
@@ -2917,6 +3305,9 @@ async fn run_embedding_job_inner(
         .map_err(|error| error.to_string())?;
     database
         .replace_indexed_skills(&profile.profile_id, &snapshot, unix_timestamp_i64()?)
+        .map_err(|error| error.to_string())?;
+    database
+        .set_profile_vectorization_complexity(&profile.profile_id, vectorization_complexity.level())
         .map_err(|error| error.to_string())?;
     if job.kind == vectorization::JobKind::ProfileMigration {
         if let Some(source_profile_id) = context
@@ -3018,10 +3409,15 @@ fn active_analysis_provider(
 
 fn classification_content(inputs: &[vectorization::GeneratedInput], max_chars: usize) -> String {
     let mut output = String::new();
+    let mut seen = std::collections::BTreeSet::new();
     for input in inputs {
         for piece in std::iter::once(input.text.as_str())
             .chain(input.chunks.iter().map(|chunk| chunk.text.as_str()))
         {
+            let piece_hash = stable_hash(piece.as_bytes());
+            if !seen.insert(piece_hash) {
+                continue;
+            }
             if output.chars().count() >= max_chars {
                 break;
             }
@@ -4380,6 +4776,43 @@ fn load_or_refresh_canonical_snapshot(
     get_or_build_canonical_snapshot(database, || build_canonical_snapshot(app, database))
 }
 
+fn apply_display_skill_summaries(
+    snapshot: &CanonicalSnapshot,
+    classifications: &[application::SkillClassification],
+) -> CanonicalSnapshot {
+    let summaries = classifications
+        .iter()
+        .filter(|item| {
+            item.status == application::SemanticRecordStatus::Ready
+                && !item.capability_summary.trim().is_empty()
+        })
+        .map(|item| (item.skill_id.as_str(), item.capability_summary.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut display = snapshot.clone();
+    for skill in &mut display.skills {
+        if let Some(summary) = summaries.get(skill.skill_id.as_str()) {
+            skill.description = Some((*summary).to_string());
+        }
+    }
+    display
+}
+
+fn snapshot_for_frontend(
+    database: &Database,
+    snapshot: &CanonicalSnapshot,
+) -> Result<CanonicalSnapshot, String> {
+    let Some(profile) = database
+        .active_profile()
+        .map_err(|error| format!("无法读取活动 Profile：{error}"))?
+    else {
+        return Ok(snapshot.clone());
+    };
+    let classifications = database
+        .classifications_for_profile(&profile.profile_id)
+        .map_err(|error| format!("无法读取 Skill 展示概述：{error}"))?;
+    Ok(apply_display_skill_summaries(snapshot, &classifications))
+}
+
 #[tauri::command]
 fn refresh_canonical_skills_snapshot(
     app: AppHandle,
@@ -4389,7 +4822,7 @@ fn refresh_canonical_skills_snapshot(
     database
         .replace_canonical_snapshot(&snapshot)
         .map_err(|error| format!("无法保存规范快照：{error}"))?;
-    Ok(snapshot)
+    snapshot_for_frontend(database.inner(), &snapshot)
 }
 
 #[tauri::command]
@@ -4397,7 +4830,8 @@ fn get_canonical_skills_snapshot(
     app: AppHandle,
     database: State<'_, Database>,
 ) -> Result<CanonicalSnapshot, String> {
-    load_or_refresh_canonical_snapshot(&app, database.inner())
+    let snapshot = load_or_refresh_canonical_snapshot(&app, database.inner())?;
+    snapshot_for_frontend(database.inner(), &snapshot)
 }
 
 #[tauri::command]
@@ -4406,6 +4840,7 @@ fn list_all_skills(
     database: State<'_, Database>,
 ) -> Result<AgentSkillsResponse, String> {
     let snapshot = load_or_refresh_canonical_snapshot(&app, database.inner())?;
+    let snapshot = snapshot_for_frontend(database.inner(), &snapshot)?;
     Ok(response_from_snapshot(&snapshot, "all", String::new()))
 }
 
@@ -4419,6 +4854,7 @@ fn list_agent_skills(
     let home = user_home()?;
     let (_, official_documentation) = agent_configuration(&agent, &home)?;
     let snapshot = load_or_refresh_canonical_snapshot(&app, database.inner())?;
+    let snapshot = snapshot_for_frontend(database.inner(), &snapshot)?;
     Ok(response_from_snapshot(
         &snapshot,
         &agent,
@@ -5181,9 +5617,11 @@ pub fn run() {
             begin_profile_rebuild_preflight,
             begin_profile_migration_preflight,
             begin_full_rebuild_preflight,
+            begin_incremental_preflight,
             get_index_sync_status,
             set_index_auto_update,
             set_ignore_built_in_skills,
+            set_vectorization_complexity,
             scan_embedding_changes,
             get_index_diff,
             list_embedding_jobs,
@@ -5195,6 +5633,11 @@ pub fn run() {
             get_search_preferences,
             set_include_disabled_skills,
             list_skill_relations,
+            list_custom_skill_categories,
+            create_custom_skill_category,
+            delete_custom_skill_category,
+            add_skills_to_custom_category,
+            replace_custom_category_members,
             get_skill_graph,
             generate_local_validation_samples,
             list_local_validation_samples,
@@ -5285,6 +5728,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn display_summary_translation_does_not_modify_the_canonical_snapshot() {
+        let mut snapshot = test_canonical_snapshot();
+        snapshot.skills[0].description = Some("Review and update code".to_string());
+        snapshot.skills[1].description = Some("Original fallback".to_string());
+        let classification = application::SkillClassification {
+            profile_id: "profile-display".to_string(),
+            skill_id: "skill-codex".to_string(),
+            input_hash: "classification-display".to_string(),
+            schema_version: CLASSIFICATION_SCHEMA_VERSION.to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            prompt_version: CLASSIFICATION_PROMPT_VERSION.to_string(),
+            broad_category: "软件交付协作".to_string(),
+            cluster_category: "代码审查".to_string(),
+            small_categories: vec!["代码审查".to_string()],
+            target_object: "代码".to_string(),
+            user_goal: "完成代码维护".to_string(),
+            capability_summary: "审查并更新代码。".to_string(),
+            workflow_summary: "读取、审查并修改。".to_string(),
+            confidence: 0.9,
+            evidence: Vec::new(),
+            status: application::SemanticRecordStatus::Ready,
+            error: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let display = apply_display_skill_summaries(&snapshot, &[classification]);
+        assert_eq!(
+            display.skills[0].description.as_deref(),
+            Some("审查并更新代码。")
+        );
+        assert_eq!(
+            display.skills[1].description.as_deref(),
+            Some("Original fallback")
+        );
+        assert_eq!(
+            snapshot.skills[0].description.as_deref(),
+            Some("Review and update code")
+        );
+    }
+
     fn test_embedding_profile(
         id: &str,
         provider: &str,
@@ -5327,10 +5813,20 @@ mod tests {
         database
             .replace_indexed_skills(&profile.profile_id, &snapshot, 1)
             .unwrap();
+        database
+            .set_profile_vectorization_complexity(&profile.profile_id, 4)
+            .unwrap();
 
         let unchanged = incremental_work_snapshot(&database, &profile.profile_id, &snapshot)
             .expect("unchanged snapshot should be reusable");
         assert!(unchanged.skills.is_empty());
+
+        database.set_vectorization_complexity(2).unwrap();
+        let complexity_rebuild =
+            incremental_work_snapshot(&database, &profile.profile_id, &snapshot)
+                .expect("complexity change should reprocess every Skill");
+        assert_eq!(complexity_rebuild.skills.len(), snapshot.skills.len());
+        database.set_vectorization_complexity(4).unwrap();
 
         let mut updated = snapshot.clone();
         updated.skills[0].content_hash = "changed-content".to_string();
@@ -5364,6 +5860,9 @@ mod tests {
         database
             .replace_indexed_skills(&profile.profile_id, &snapshot, 1)
             .unwrap();
+        database
+            .set_profile_vectorization_complexity(&profile.profile_id, 4)
+            .unwrap();
         for (index, skill) in snapshot.skills.iter().take(2).enumerate() {
             database
                 .save_skill_classification(&application::SkillClassification {
@@ -5375,6 +5874,7 @@ mod tests {
                     model: "gpt-test".to_string(),
                     prompt_version: CLASSIFICATION_PROMPT_VERSION.to_string(),
                     broad_category: "开发工具".to_string(),
+                    cluster_category: "自动化".to_string(),
                     small_categories: vec!["自动化".to_string()],
                     target_object: "代码".to_string(),
                     user_goal: "完成开发".to_string(),

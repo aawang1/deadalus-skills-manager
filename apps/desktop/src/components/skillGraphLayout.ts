@@ -41,9 +41,27 @@ export function calculateSkillGraphLayout(graph: SkillGraphSnapshot): SkillGraph
     const center = clusterPoints.get(cluster.clusterId) ?? CENTER;
     const radius = clusterRadii.get(cluster.clusterId) ?? 110;
     const members = cluster.memberSkillIds.map((id) => nodesById.get(id)).filter((node): node is NonNullable<typeof node> => Boolean(node)).sort((left, right) => right.centrality - left.centrality || left.skillId.localeCompare(right.skillId));
+    const secondaryCategories = [...new Set(members.map((node) => normalizedSecondaryCategory(node.clusterCategory, node.skillId)))].sort();
+    const categoryMembers = new Map<string, typeof members>();
+    members.forEach((node) => {
+      const category = normalizedSecondaryCategory(node.clusterCategory, node.skillId);
+      const grouped = categoryMembers.get(category) ?? [];
+      grouped.push(node);
+      categoryMembers.set(category, grouped);
+    });
+    const categoryRotation = seededUnit(`secondary:${cluster.clusterId}`) * Math.PI * 2;
     members.forEach((node, index) => {
       const ring = cluster.coreSkillIds.includes(node.skillId) ? 50 + index * 8 : 70 + (1 - clamp(node.centrality, 0, 1)) * (radius - 76);
-      const angle = index * 2.399963229728653 + seededUnit(node.skillId) * 0.5;
+      const category = normalizedSecondaryCategory(node.clusterCategory, node.skillId);
+      const categoryIndex = secondaryCategories.indexOf(category);
+      const siblings = categoryMembers.get(category) ?? [node];
+      const siblingIndex = siblings.findIndex((item) => item.skillId === node.skillId);
+      const sectorSize = Math.PI * 2 / Math.max(1, secondaryCategories.length);
+      const sectorSpread = Math.min(0.72, sectorSize * 0.34);
+      const siblingOffset = siblings.length <= 1
+        ? (seededUnit(node.skillId) - 0.5) * Math.min(0.18, sectorSpread)
+        : ((siblingIndex / (siblings.length - 1)) - 0.5) * sectorSpread;
+      const angle = categoryRotation + categoryIndex * sectorSize + siblingOffset;
       nodePoints.set(node.skillId, { x: center.x + Math.cos(angle) * ring, y: center.y + Math.sin(angle) * ring });
     });
   }
@@ -569,5 +587,6 @@ function safeDelta(left: GraphPoint, right: GraphPoint, seed: string) {
 
 export function parallelEdgeOffset(index: number, count: number): number { return (index - (count - 1) / 2) * 7; }
 function seededUnit(value: string): number { let hash = 2166136261; for (let index = 0; index < value.length; index += 1) { hash ^= value.charCodeAt(index); hash = Math.imul(hash, 16777619); } return (hash >>> 0) / 4294967295; }
+function normalizedSecondaryCategory(category: string, fallback: string): string { const normalized = category.trim().toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ""); return normalized || fallback; }
 function orderedPair(left: string, right: string): [string, string] { return left <= right ? [left, right] : [right, left]; }
 function clamp(value: number, minimum: number, maximum: number): number { return Math.min(maximum, Math.max(minimum, value)); }

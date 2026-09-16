@@ -11,9 +11,9 @@ const graph: SkillGraphSnapshot = {
   excludedUnconnectedCount: 0,
   clusters: [{ clusterId: "cluster-a", name: "开发", summary: "开发能力", memberSkillIds: ["a", "b"], coreSkillIds: ["a", "b"], peripheral: false, semanticStatus: "ready" }],
   nodes: [
-    { skillId: "a", name: "A", path: "C:/a", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.94, superseded: false, disabled: false, classificationStatus: "ready" },
-    { skillId: "b", name: "B", path: "C:/b", enabledAgents: ["cursor"], clusterId: "cluster-a", centrality: 0.9, superseded: false, disabled: false, classificationStatus: "ready" },
-    { skillId: "c", name: "C", path: "C:/c", enabledAgents: ["cursor"], centrality: 0, superseded: false, disabled: false, classificationStatus: "ready" },
+    { skillId: "a", name: "A", path: "C:/a", enabledAgents: ["cursor"], clusterId: "cluster-a", broadCategory: "开发", clusterCategory: "前端", centrality: 0.94, superseded: false, disabled: false, classificationStatus: "ready" },
+    { skillId: "b", name: "B", path: "C:/b", enabledAgents: ["cursor"], clusterId: "cluster-a", broadCategory: "开发", clusterCategory: "后端", centrality: 0.9, superseded: false, disabled: false, classificationStatus: "ready" },
+    { skillId: "c", name: "C", path: "C:/c", enabledAgents: ["cursor"], broadCategory: "其他", clusterCategory: "独立", centrality: 0, superseded: false, disabled: false, classificationStatus: "ready" },
   ],
   edges: [{ edgeId: "a-b", sourceSkillId: "a", targetSkillId: "b", similarity: 0.92, nearestFallback: false, relations: [{ relationshipType: "similar_to", vectorType: "overall_function", state: "over_threshold", source: "vector_similarity", evidence: {} }] }],
   proximities: [],
@@ -34,6 +34,17 @@ describe("skill graph layout", () => {
     for (let left = 0; left < points.length; left += 1) for (let right = left + 1; right < points.length; right += 1) {
       expect(Math.hypot(points[left].x - points[right].x, points[left].y - points[right].y)).toBeGreaterThanOrEqual(61.8);
     }
+  });
+
+  it("uses secondary categories as different angular regions inside one primary cluster", () => {
+    const layout = calculateSkillGraphLayout(graph);
+    const center = layout.clusterPoints.get("cluster-a")!;
+    const a = layout.nodePoints.get("a")!;
+    const b = layout.nodePoints.get("b")!;
+    const first = Math.atan2(a.y - center.y, a.x - center.x);
+    const second = Math.atan2(b.y - center.y, b.x - center.x);
+    const difference = Math.abs(Math.atan2(Math.sin(first - second), Math.cos(first - second)));
+    expect(difference).toBeGreaterThan(0.45);
   });
 
   it("centers parallel edge offsets", () => {

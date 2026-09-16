@@ -34,7 +34,7 @@ interface PendingSwitch {
 }
 
 interface EstimateExecution {
-  strategy: "full_rebuild" | "profile_migration";
+  strategy: "incremental" | "full_rebuild" | "profile_migration";
   request?: ProfileChangeRequest;
   profileId?: string;
 }

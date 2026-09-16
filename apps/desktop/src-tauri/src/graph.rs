@@ -14,6 +14,8 @@ pub const VISUAL_EDGE_TOP_K: usize = 5;
 pub const CLUSTER_SIMILARITY_THRESHOLD: f32 = 0.78;
 pub const CLASSIFIED_VECTOR_FLOOR: f32 = 0.62;
 pub const CLASSIFICATION_AFFINITY_THRESHOLD: f32 = 0.20;
+pub const SAME_CATEGORY_VECTOR_SPLIT_FLOOR: f32 = 0.28;
+pub const SAME_CATEGORY_AFFINITY_SPLIT_FLOOR: f32 = 0.08;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +41,8 @@ pub struct SkillGraphNode {
     pub path: String,
     pub enabled_agents: Vec<String>,
     pub cluster_id: Option<String>,
+    pub broad_category: String,
+    pub cluster_category: String,
     pub centrality: f32,
     pub superseded: bool,
     pub disabled: bool,
@@ -93,6 +97,7 @@ struct PairSimilarity {
     source: String,
     target: String,
     score: f32,
+    workflow_score: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +226,7 @@ pub fn build_classified_skill_graph(
             normalize(&vector.vector).map(|normalized| (skill_id.clone(), normalized))
         })
         .collect::<HashMap<_, _>>();
+    let normalized_workflow_vectors = normalized_parent_vectors(vectors, VectorType::Workflow);
     for (index, source_id) in ready_ids.iter().enumerate() {
         for target_id in ready_ids.iter().skip(index + 1) {
             if conflict_pairs.contains(&ordered_pair(source_id, target_id)) {
@@ -244,6 +250,17 @@ pub fn build_classified_skill_graph(
                 source: source_id.clone(),
                 target: target_id.clone(),
                 score,
+                workflow_score: normalized_workflow_vectors
+                    .get(source_id)
+                    .zip(normalized_workflow_vectors.get(target_id))
+                    .filter(|(source, target)| source.len() == target.len())
+                    .map(|(source, target)| {
+                        source
+                            .iter()
+                            .zip(target.iter())
+                            .map(|(left, right)| left * right)
+                            .sum()
+                    }),
             });
         }
     }
@@ -308,9 +325,11 @@ pub fn build_classified_skill_graph(
     let nodes = ready_skills
         .values()
         .map(|(skill, _)| {
+            let classification = classification_by_skill.get(&skill.skill_id).copied();
             graph_node(
                 skill,
                 cluster_by_skill.get(&skill.skill_id).cloned(),
+                classification,
                 *centrality_by_skill.get(&skill.skill_id).unwrap_or(&0.0),
                 superseded_ids.contains(&skill.skill_id),
                 disabled_ids.contains(&skill.skill_id),
@@ -339,7 +358,12 @@ pub fn build_classified_skill_graph(
         &conflict_pairs,
         |kind| kind != RelationshipType::ConflictsWith,
     );
-    let proximities = build_proximities(&relevant_relationships, &node_ids, &conflict_pairs);
+    let mut proximities = build_proximities(&relevant_relationships, &node_ids, &conflict_pairs);
+    proximities.extend(build_taxonomy_proximities(
+        &similarities,
+        &classification_by_skill,
+        &node_ids,
+    ));
     let mut candidates = BTreeMap::<(String, String), EdgeCandidate>::new();
     for pair in similarities
         .iter()
@@ -419,6 +443,7 @@ fn synthetic_ready_classification(profile_id: &str, skill: &CanonicalSkill) -> S
         model: "deterministic".to_string(),
         prompt_version: "legacy-test".to_string(),
         broad_category: "legacy-test".to_string(),
+        cluster_category: "legacy-test".to_string(),
         small_categories: vec!["legacy-test".to_string()],
         target_object: "legacy-test".to_string(),
         user_goal: "legacy-test".to_string(),
@@ -440,7 +465,9 @@ fn synthetic_ready_classification(profile_id: &str, skill: &CanonicalSkill) -> S
 }
 
 fn belongs_to_view(skill: &CanonicalSkill, view_id: &str) -> bool {
-    view_id == "all" || skill.enabled_agents.iter().any(|agent| agent == view_id)
+    view_id == "all"
+        || view_id.starts_with("custom:")
+        || skill.enabled_agents.iter().any(|agent| agent == view_id)
 }
 
 fn ready_overall_vectors(vectors: &[StoredVector]) -> HashMap<String, &StoredVector> {
@@ -462,9 +489,35 @@ fn ready_overall_vectors(vectors: &[StoredVector]) -> HashMap<String, &StoredVec
     selected
 }
 
+fn normalized_parent_vectors(
+    vectors: &[StoredVector],
+    vector_type: VectorType,
+) -> HashMap<String, Vec<f32>> {
+    let mut selected = HashMap::<String, &StoredVector>::new();
+    for vector in vectors.iter().filter(|vector| {
+        vector.vector_type == vector_type
+            && vector.level == VectorLevel::Parent
+            && vector.status == VectorStatus::Ready
+    }) {
+        selected
+            .entry(vector.skill_id.clone())
+            .and_modify(|current| {
+                if vector.embedding_id > current.embedding_id {
+                    *current = vector;
+                }
+            })
+            .or_insert(vector);
+    }
+    selected
+        .into_iter()
+        .filter_map(|(skill_id, vector)| normalize(&vector.vector).map(|value| (skill_id, value)))
+        .collect()
+}
+
 fn graph_node(
     skill: &CanonicalSkill,
     cluster_id: Option<String>,
+    classification: Option<&SkillClassification>,
     centrality: f32,
     superseded: bool,
     disabled: bool,
@@ -473,10 +526,23 @@ fn graph_node(
     SkillGraphNode {
         skill_id: skill.skill_id.clone(),
         name: skill.name.clone(),
-        description: skill.description.clone(),
+        description: classification
+            .filter(|item| {
+                item.status == SemanticRecordStatus::Ready
+                    && !item.capability_summary.trim().is_empty()
+            })
+            .map(|item| item.capability_summary.clone())
+            .or_else(|| skill.description.clone()),
         path: skill.path.clone(),
         enabled_agents: skill.enabled_agents.clone(),
         cluster_id,
+        broad_category: classification
+            .map(|item| item.broad_category.clone())
+            .unwrap_or_default(),
+        cluster_category: classification
+            .map(effective_cluster_category)
+            .unwrap_or_default()
+            .to_string(),
         centrality,
         superseded,
         disabled,
@@ -606,6 +672,53 @@ fn build_proximities(
         .collect()
 }
 
+fn build_taxonomy_proximities(
+    similarities: &[PairSimilarity],
+    classifications: &HashMap<String, &SkillClassification>,
+    node_ids: &HashSet<String>,
+) -> Vec<SkillGraphProximity> {
+    similarities
+        .iter()
+        .filter_map(|pair| {
+            if !node_ids.contains(&pair.source) || !node_ids.contains(&pair.target) {
+                return None;
+            }
+            let (source, target) = (
+                classifications.get(&pair.source)?,
+                classifications.get(&pair.target)?,
+            );
+            if source.cluster_category.trim().is_empty()
+                || target.cluster_category.trim().is_empty()
+                || normalize_label(&source.cluster_category)
+                    == normalize_label(&source.broad_category)
+                || normalize_label(&target.cluster_category)
+                    == normalize_label(&target.broad_category)
+            {
+                return None;
+            }
+            if normalize_label(&source.broad_category) != normalize_label(&target.broad_category)
+                || normalize_label(effective_cluster_category(source))
+                    != normalize_label(effective_cluster_category(target))
+            {
+                return None;
+            }
+            let small = small_category_affinity(source, target);
+            let workflow = pair.workflow_score.unwrap_or(0.0).clamp(0.0, 1.0);
+            let function = pair.score.clamp(0.0, 1.0);
+            Some(SkillGraphProximity {
+                source_skill_id: pair.source.clone(),
+                target_skill_id: pair.target.clone(),
+                weight: (0.5 * small + 0.3 * workflow + 0.2 * function).clamp(0.05, 1.0),
+                relationship_types: vec![
+                    "same_cluster_category".to_string(),
+                    "small_category_similarity".to_string(),
+                    "workflow_similarity".to_string(),
+                ],
+            })
+        })
+        .collect()
+}
+
 fn build_clusters(
     ready_skills: &BTreeMap<String, (&CanonicalSkill, &StoredVector)>,
     similarities: &[PairSimilarity],
@@ -627,7 +740,7 @@ fn build_clusters(
         ) else {
             return false;
         };
-        category_compatible(source, target, pair.score)
+        category_compatible(source, target, pair)
     }) {
         adjacency
             .entry(pair.source.clone())
@@ -735,42 +848,35 @@ fn build_clusters(
 fn category_compatible(
     source: &SkillClassification,
     target: &SkillClassification,
-    vector_similarity: f32,
+    similarity: &PairSimilarity,
 ) -> bool {
-    let source_broad = normalize_label(&source.broad_category);
-    let target_broad = normalize_label(&target.broad_category);
-    let broad_affinity = jaccard(
-        &semantic_terms(&source.broad_category),
-        &semantic_terms(&target.broad_category),
-    );
-    // Broad categories are a strong boundary, but not a brittle enum: the LLM
-    // may produce near-synonyms such as “网页前端” and “前端界面开发”.  Exact
-    // labels always match; otherwise substantial semantic overlap is required.
-    // Generic shared words such as “设计” are insufficient on their own.
-    if source_broad != target_broad && broad_affinity < 0.45 {
+    // Level one is the cluster boundary. Level two is supporting evidence used
+    // for validation and internal layout; a different level-two label must not
+    // fragment an otherwise coherent level-one cluster.
+    if normalize_label(&source.broad_category) != normalize_label(&target.broad_category) {
         return false;
     }
-    let required_affinity = if vector_similarity >= CLUSTER_SIMILARITY_THRESHOLD {
-        CLASSIFICATION_AFFINITY_THRESHOLD * 0.75
+    // Function, workflow and descriptive affinity may still split an obviously
+    // incompatible pair. Level-two disagreement alone is never sufficient.
+    let workflow_is_distant = similarity
+        .workflow_score
+        .is_none_or(|score| score < SAME_CATEGORY_VECTOR_SPLIT_FLOOR);
+    similarity.score >= 0.0
+        && !(similarity.score < SAME_CATEGORY_VECTOR_SPLIT_FLOOR
+            && workflow_is_distant
+            && classification_affinity(source, target) < SAME_CATEGORY_AFFINITY_SPLIT_FLOOR)
+}
+
+fn effective_cluster_category(classification: &SkillClassification) -> &str {
+    if classification.cluster_category.trim().is_empty() {
+        &classification.broad_category
     } else {
-        CLASSIFICATION_AFFINITY_THRESHOLD
-    };
-    classification_affinity(source, target) >= required_affinity
-        && vector_similarity >= CLASSIFIED_VECTOR_FLOOR
+        &classification.cluster_category
+    }
 }
 
 fn classification_affinity(source: &SkillClassification, target: &SkillClassification) -> f32 {
-    let source_small = source
-        .small_categories
-        .iter()
-        .flat_map(|value| semantic_terms(value))
-        .collect::<BTreeSet<_>>();
-    let target_small = target
-        .small_categories
-        .iter()
-        .flat_map(|value| semantic_terms(value))
-        .collect::<BTreeSet<_>>();
-    0.45 * jaccard(&source_small, &target_small)
+    0.45 * small_category_affinity(source, target)
         + 0.25
             * jaccard(
                 &semantic_terms(&source.target_object),
@@ -786,6 +892,20 @@ fn classification_affinity(source: &SkillClassification, target: &SkillClassific
                 &semantic_terms(&source.workflow_summary),
                 &semantic_terms(&target.workflow_summary),
             )
+}
+
+fn small_category_affinity(source: &SkillClassification, target: &SkillClassification) -> f32 {
+    let source_small = source
+        .small_categories
+        .iter()
+        .flat_map(|value| semantic_terms(value))
+        .collect::<BTreeSet<_>>();
+    let target_small = target
+        .small_categories
+        .iter()
+        .flat_map(|value| semantic_terms(value))
+        .collect::<BTreeSet<_>>();
+    jaccard(&source_small, &target_small)
 }
 
 fn normalize_label(value: &str) -> String {
@@ -825,10 +945,11 @@ fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f32 {
 fn temporary_cluster_name(classifications: &[&SkillClassification]) -> String {
     let mut counts = BTreeMap::<String, (String, usize)>::new();
     for classification in classifications {
-        let key = normalize_label(&classification.broad_category);
+        let cluster_category = effective_cluster_category(classification);
+        let key = normalize_label(cluster_category);
         let entry = counts
             .entry(key)
-            .or_insert_with(|| (classification.broad_category.clone(), 0));
+            .or_insert_with(|| (cluster_category.to_string(), 0));
         entry.1 += 1;
     }
     counts
@@ -970,7 +1091,7 @@ fn graph_version(
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
         parts.push(format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             node.skill_id,
             node.name,
             node.description.as_deref().unwrap_or_default(),
@@ -978,6 +1099,8 @@ fn graph_version(
             node.enabled_agents.join(","),
             node.disabled,
             node.classification_status,
+            node.broad_category,
+            node.cluster_category,
             vector_version,
         ));
     }
@@ -1036,8 +1159,13 @@ fn layout_version(
             .map(|(_, vector)| format!("{}:{}", vector.embedding_id, vector.input_hash))
             .unwrap_or_default();
         parts.push(format!(
-            "{}:{}:{}:{}",
-            node.skill_id, node.disabled, node.classification_status, vector_version
+            "{}:{}:{}:{}:{}:{}",
+            node.skill_id,
+            node.disabled,
+            node.classification_status,
+            node.broad_category,
+            node.cluster_category,
+            vector_version
         ));
     }
     stable_hash(parts.join("\n").as_bytes())
@@ -1120,6 +1248,7 @@ mod tests {
             model: "test".to_string(),
             prompt_version: "v1".to_string(),
             broad_category: broad.to_string(),
+            cluster_category: broad.to_string(),
             small_categories: small.iter().map(|value| (*value).to_string()).collect(),
             target_object: target.to_string(),
             user_goal: format!("完成 {target}"),
@@ -1276,6 +1405,87 @@ mod tests {
     }
 
     #[test]
+    fn level_one_category_drives_clusters_while_level_two_refines_them() {
+        let source = snapshot(vec![
+            skill("figma", "cursor"),
+            skill("image", "cursor"),
+            skill("game-ui", "cursor"),
+        ]);
+        let vectors = [
+            vector("figma", vec![1.0, 0.0]),
+            vector("image", vec![0.45, 0.55]),
+            vector("game-ui", vec![0.99, 0.01]),
+        ];
+        let mut figma = classification(
+            "figma",
+            "Web界面设计与实现",
+            &["设计稿解析", "组件实现"],
+            "网页界面",
+        );
+        figma.cluster_category = "设计稿转前端代码".to_string();
+        let mut image = classification(
+            "image",
+            "Web界面设计与实现",
+            &["视觉提取", "组件实现"],
+            "网页界面",
+        );
+        image.cluster_category = "图像转前端代码".to_string();
+        let mut game = classification(
+            "game-ui",
+            "游戏界面与交互",
+            &["HUD", "控制器导航"],
+            "游戏界面",
+        );
+        game.cluster_category = "游戏UI设计".to_string();
+        let graph = build_classified_skill_graph(
+            &source,
+            "profile",
+            &vectors,
+            &[],
+            &[figma, image, game],
+            &[],
+            "all",
+        );
+        assert_eq!(graph.clusters.len(), 1);
+        assert_eq!(graph.clusters[0].member_skill_ids.len(), 2);
+        assert!(graph.clusters[0]
+            .member_skill_ids
+            .contains(&"figma".to_string()));
+        assert!(graph.clusters[0]
+            .member_skill_ids
+            .contains(&"image".to_string()));
+        assert_ne!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "figma")
+                .unwrap()
+                .cluster_category,
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "image")
+                .unwrap()
+                .cluster_category
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.skill_id == "figma")
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("处理 网页界面")
+        );
+        assert!(graph
+            .nodes
+            .iter()
+            .find(|node| node.skill_id == "game-ui")
+            .is_some_and(|node| node.cluster_id.is_none()));
+    }
+
+    #[test]
     fn conflict_suppresses_all_edges_and_unconnectable_nodes() {
         let graph = build_skill_graph(
             &snapshot(vec![skill("a", "cursor"), skill("b", "cursor")]),
@@ -1426,5 +1636,11 @@ mod tests {
                 .unwrap()
                 .superseded
         );
+    }
+
+    #[test]
+    fn custom_view_accepts_every_skill_in_its_prefiltered_snapshot() {
+        let member = skill("member", "codex");
+        assert!(belongs_to_view(&member, "custom:category-visual"));
     }
 }
