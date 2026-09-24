@@ -1,6 +1,6 @@
 [package]
 name = "deadalus-desktop"
-version = "0.1.0"
+version = "1.0.0"
 description = "A local-first Agent Skills manager"
 authors = ["Deadalus contributors"]
 edition = "2021"

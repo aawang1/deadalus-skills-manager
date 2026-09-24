@@ -1,0 +1,17 @@
+{
+  "bundle": {
+    "targets": ["nsis"],
+    "shortDescription": "Local-first Agent Skills manager",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    }
+  }
+}
