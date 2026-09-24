@@ -16,6 +16,8 @@ export function filterCanonicalSkills(
     : options.agentFilter;
 
   return skills.filter((skill) => {
+    // List visibility only: preserve built-ins in the canonical snapshot.
+    if (skill.isBuiltIn) return false;
     const matchesQuery =
       !query ||
       skill.name.toLocaleLowerCase().includes(query) ||

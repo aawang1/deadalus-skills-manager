@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { setLanguage } from "./i18n";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -60,6 +61,9 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 describe("B3 assistant platform", () => {
   beforeEach(() => {
+    window.localStorage.removeItem("deadalus.agent-windows.count");
+    window.localStorage.removeItem("deadalus.agent-windows.v2");
+    window.localStorage.removeItem("deadalus.agent-windows.v3");
     mocks.getCanonicalSkillsSnapshot.mockResolvedValue({
       snapshotId: "snapshot-a",
       searchedPaths: [],
@@ -92,6 +96,40 @@ describe("B3 assistant platform", () => {
     mocks.disableSkillForAgent.mockReset();
     mocks.copyLibrarySkillToAgent.mockReset();
     mocks.replaceCustomCategoryMembers.mockReset();
+  });
+
+  it("styles right-side agents as categories and uses their bound category color", async () => {
+    mocks.listCustomSkillCategories.mockResolvedValueOnce([
+      { categoryId: "colored-agent", name: "设计项目", description: "Design", color: "#de6ea8", skillIds: [], createdAt: 1, updatedAt: 1, projectRoot: "D:/demo" },
+    ]);
+    window.localStorage.setItem("deadalus.agent-windows.v3", JSON.stringify({ ids: [1, 2], nextId: 3, bindings: { "1": "custom:colored-agent", "2": "all" } }));
+    const user = userEvent.setup();
+    render(<App />);
+    const agent = await screen.findByRole("button", { name: "打开 Agent 1" });
+    await waitFor(() => expect(agent.querySelector(".category-button__dot")).toHaveStyle({ backgroundColor: "#de6ea8" }));
+    expect(agent).toHaveClass("agent-button", "category-button");
+    expect(screen.getByRole("button", { name: "打开 Agent 2" }).querySelector(".category-button__dot")).toBeNull();
+    await user.click(agent);
+    expect(agent).toHaveClass("agent-button--active");
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    expect(agent.querySelector(".category-button__dot")).toHaveStyle({ backgroundColor: "#de6ea8" });
+  });
+
+  it("switches sidebar language without rescanning the library", async () => {
+    render(<App />);
+    expect(screen.queryByText("A1", { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开 API Key 管理" }).querySelector("img")).toHaveAttribute("src", "/deadalus-icon.svg");
+    expect(within(screen.getByRole("navigation", { name: "Agent 窗口列表" })).getByText("自动整理skills agent")).toBeInTheDocument();
+    await waitFor(() => expect(mocks.getCanonicalSkillsSnapshot).toHaveBeenCalled());
+    const reads = mocks.getCanonicalSkillsSnapshot.mock.calls.length;
+    const refreshes = mocks.refreshCanonicalSkillsSnapshot.mock.calls.length;
+    act(() => setLanguage("en"));
+    expect(screen.getByText("Skill organization agent")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "All Skills" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New project" })).toBeInTheDocument();
+    expect(mocks.getCanonicalSkillsSnapshot).toHaveBeenCalledTimes(reads);
+    expect(mocks.refreshCanonicalSkillsSnapshot).toHaveBeenCalledTimes(refreshes);
+    act(() => setLanguage("zh"));
   });
 
   it("shows a scoped second confirmation before deleting an all_skills backup", async () => {
@@ -148,10 +186,10 @@ describe("B3 assistant platform", () => {
       skills: [{
         skillId: "skill-docs",
         name: "OpenAI Docs",
-        path: "C:/Users/demo/.codex/skills/.system/openai-docs",
-        sourcePath: "C:/Users/demo/.codex/skills/.system",
-        scope: "system",
-        isBuiltIn: true,
+        path: "C:/Users/demo/.agents/skills/openai-docs",
+        sourcePath: "C:/Users/demo/.agents/skills",
+        scope: "user",
+        isBuiltIn: false,
         enabledAgents: ["codex"],
         disabledAgents: [],
         inLibrary: false,
@@ -166,7 +204,7 @@ describe("B3 assistant platform", () => {
       viewId: "codex",
       action: "disable",
       allowed: true,
-      targetPaths: ["C:/Users/demo/.codex/skills/.system/openai-docs"],
+      targetPaths: ["C:/Users/demo/.agents/skills/openai-docs"],
       affectedAgents: ["codex"],
       sharedInstallation: false,
       pluginOperation: false,
@@ -235,32 +273,166 @@ describe("B3 assistant platform", () => {
     expect(screen.getByRole("heading", { name: "所有 Skills" })).toBeInTheDocument();
   });
 
-  it("starts collapsed, toggles from the circular control, and retains search state", async () => {
+  it("starts collapsed, toggles from the circular control, and retains the input draft", async () => {
     const user = userEvent.setup();
     render(<App />);
 
     const platform = screen.getByRole("complementary", {
-      name: "B3 语义搜索平台",
+      name: "B3 Agent 平台",
     });
-    const expand = screen.getByRole("button", { name: "展开语义搜索" });
-    expect(expand).toHaveAttribute("aria-expanded", "false");
+    const add = screen.getByRole("button", { name: "新建 Agent 窗口" });
+    expect(add).toBeDisabled();
     expect(platform.firstElementChild).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByRole("main", { name: "A1 可视化工作区" })).toBeEmptyDOMElement();
 
-    await user.click(expand);
-    const collapse = screen.getByRole("button", { name: "收起语义搜索" });
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    expect(add).toBeEnabled();
+    await user.click(add);
+    const collapse = screen.getByRole("button", { name: "收起 Agent 1" });
     expect(collapse).toHaveAttribute("aria-expanded", "true");
     expect(platform.firstElementChild).toHaveAttribute("aria-hidden", "false");
 
-    const searchbox = screen.getByRole("searchbox");
-    await user.type(searchbox, "retained query");
+    expect(within(platform).queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+    const input = screen.getByRole("textbox", { name: "Agent 1 输入" });
+    await user.type(input, "retained draft");
     await user.click(collapse);
-    expect(screen.getByRole("button", { name: "展开语义搜索" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "打开 Agent 1" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
-    await user.click(screen.getByRole("button", { name: "展开语义搜索" }));
-    expect(screen.getByRole("searchbox")).toHaveValue("retained query");
+    await user.click(screen.getByRole("button", { name: "打开 Agent 1" }));
+    expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("retained draft");
+  });
+
+  it("creates independent Agent windows and switches without losing their input drafts", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    const rail = screen.getByRole("navigation", { name: "Agent 窗口列表" });
+    expect(within(rail).getByRole("button", { name: "新建 Agent 窗口" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(within(rail).getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 1 输入" }), "first draft");
+    await user.click(screen.getByRole("button", { name: "Codex Skills" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("complementary", { name: "B3 Agent 平台" }).firstElementChild,
+      ).toHaveAttribute("aria-hidden", "true"),
+    );
+    await user.click(within(rail).getByRole("button", { name: "新建 Agent 窗口" }));
+    expect(screen.getByRole("button", { name: "收起 Agent 2" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await user.type(screen.getByRole("textbox", { name: "Agent 2 输入" }), "second draft");
+    await user.click(screen.getByRole("button", { name: "新建" }));
+    expect(screen.getByRole("button", { name: "新建" })).toHaveAttribute("aria-pressed", "true");
+
+    await user.click(screen.getByRole("button", { name: "打开 Agent 1" }));
+    expect(screen.getByRole("button", { name: "所有 Skills" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("first draft");
+    expect(screen.getByRole("button", { name: "新建" })).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(screen.getByRole("button", { name: "打开 Agent 2" }));
+    expect(screen.getByRole("button", { name: "Codex Skills" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("textbox", { name: "Agent 2 输入" })).toHaveValue("second draft");
+    expect(screen.getByRole("button", { name: "新建" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "收起 Agent 2" }));
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "打开 Agent 1" }));
+    expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("first draft");
+  });
+
+  it("restores locally created Agent entries after remount without opening B3", async () => {
+    const user = userEvent.setup();
+    const first = render(<App />);
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    expect(JSON.parse(window.localStorage.getItem("deadalus.agent-windows.v3")!)).toEqual({
+      ids: [1],
+      nextId: 2,
+      bindings: { "1": "all" },
+    });
+    first.unmount();
+
+    render(<App />);
+    expect(screen.getByRole("button", { name: "打开 Agent 1" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "打开 Agent 1" }));
+    expect(screen.getByRole("button", { name: "所有 Skills" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("deletes a selected Agent window only after right-click confirmation", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 1 输入" }), "temporary draft");
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "收起 Agent 1" }), {
+      clientX: 120,
+      clientY: 160,
+    });
+    await user.click(screen.getByRole("menuitem", { name: "删除该 Agent 窗口" }));
+    const dialog = screen.getByRole("alertdialog", { name: "删除 Agent 窗口" });
+    expect(within(dialog).getByText(/未发送输入会丢失/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "取消" }));
+    expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("temporary draft");
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "收起 Agent 1" }));
+    await user.click(screen.getByRole("menuitem", { name: "删除该 Agent 窗口" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    expect(screen.queryByRole("button", { name: "打开 Agent 1" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(JSON.parse(window.localStorage.getItem("deadalus.agent-windows.v3")!)).toEqual({
+      ids: [],
+      nextId: 2,
+      bindings: {},
+    });
+  });
+
+  it("keeps later Agent identities and drafts when deleting a middle window", async () => {
+    const user = userEvent.setup();
+    const view = render(<App />);
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 3 输入" }), "third draft");
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "打开 Agent 2" }));
+    await user.click(screen.getByRole("menuitem", { name: "删除该 Agent 窗口" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    expect(screen.getByRole("textbox", { name: "Agent 3 输入" })).toHaveValue("third draft");
+    expect(screen.queryByRole("button", { name: "打开 Agent 2" })).not.toBeInTheDocument();
+
+    view.unmount();
+    render(<App />);
+    expect(screen.getByRole("button", { name: "打开 Agent 3" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    expect(screen.getByRole("button", { name: "收起 Agent 4" })).toBeInTheDocument();
+  });
+
+  it("can delete the final Agent window and create a fresh one", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    expect(screen.getByRole("button", { name: "新建 Agent 窗口" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    fireEvent.contextMenu(screen.getByRole("button", { name: "收起 Agent 1" }));
+    await user.click(screen.getByRole("menuitem", { name: "删除该 Agent 窗口" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    expect(screen.queryByRole("button", { name: "打开 Agent 1" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建 Agent 窗口" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    expect(screen.getByRole("button", { name: "收起 Agent 2" })).toBeInTheDocument();
   });
 
   it("collapses B2 to an arrow strip while keeping the category selected", async () => {

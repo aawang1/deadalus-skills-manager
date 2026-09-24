@@ -215,6 +215,8 @@ mod tests {
 
     fn profile() -> EmbeddingProfile {
         EmbeddingProfile {
+            name: String::new(),
+            description: String::new(),
             profile_id: "profile".to_string(),
             provider: "openai".to_string(),
             model: "text-embedding-3-small".to_string(),

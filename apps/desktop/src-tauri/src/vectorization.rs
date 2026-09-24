@@ -164,6 +164,10 @@ impl FromStr for ProfileStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingProfile {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub profile_id: String,
     pub provider: String,
     pub model: String,

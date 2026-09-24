@@ -5,6 +5,7 @@ export type ProviderId = "anthropic" | "openai" | "deepseek" | "qwen";
 export type CredentialPurpose = "agent" | "embedding";
 
 export interface ApiKeyMetadata {
+  purpose?: CredentialPurpose | null;
   id: string;
   provider: ProviderId;
   maskedKey: string;
@@ -32,7 +33,7 @@ export interface InstalledSkill {
   description?: string;
   path: string;
   sourcePath: string;
-  scope: "user" | "system";
+  scope: "user" | "system" | "project" | "library";
   isBuiltIn: boolean;
   enabledAgents: AgentId[];
   disabledAgents: AgentId[];
@@ -77,6 +78,9 @@ export interface CanonicalSnapshot {
 }
 
 export interface CustomSkillCategory {
+  sharedSkillIds?: string[];
+  projectRoot?: string | null;
+  projectAgent?: string | null;
   categoryId: string;
   name: string;
   color: string;
@@ -87,6 +91,7 @@ export interface CustomSkillCategory {
 }
 
 export interface CreateCustomSkillCategoryRequest {
+  projectRoot?: string;
   name: string;
   color: string;
   description: string;
@@ -115,6 +120,8 @@ export type ProfileStatus =
   | "archived";
 
 export interface EmbeddingProfile {
+  name?: string;
+  description?: string;
   profileId: string;
   provider: ProviderId;
   model: string;
@@ -139,10 +146,8 @@ export interface EmbeddingProfileDefaults {
 }
 
 export interface CreateEmbeddingProfileRequest {
-  provider: ProviderId;
-  model: string;
-  version: string;
-  dimensions: number;
+  name: string;
+  description: string;
   credentialId: string;
 }
 
@@ -305,6 +310,13 @@ export interface SemanticSearchResult {
   expired: boolean;
   matchedTypes: VectorType[];
   evidence: SearchEvidence[];
+}
+
+export interface AgentSkillRecommendation {
+  viewId: ViewId;
+  summary: string;
+  results: SemanticSearchResult[];
+  warnings?: string[];
 }
 
 export type RelationshipType =

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { filterCanonicalSkills } from "./canonical";
-import type { InstalledSkill } from "./types";
+import type { InstalledSkill, ViewId } from "./types";
 
 const skills: InstalledSkill[] = [
   {
@@ -30,6 +30,19 @@ const skills: InstalledSkill[] = [
 ];
 
 describe("filterCanonicalSkills", () => {
+  it.each<ViewId>(["all", "codex", "cursor", "claude-code", "custom:virtual", "custom:project"])(
+    "hides built-ins in %s, including when searched, without changing the snapshot",
+    (activeView) => {
+      const normal: InstalledSkill = { ...skills[0], enabledAgents: ["codex", "cursor", "claude-code"] };
+      const builtIn: InstalledSkill = { ...normal, skillId: "built-in", name: "Built-in Helper", isBuiltIn: true };
+      const snapshot = [normal, builtIn];
+      const options = { activeView, agentFilter: "all" as const, searchQuery: "", customSkillIds: new Set([normal.skillId, builtIn.skillId]) };
+      expect(filterCanonicalSkills(snapshot, options)).toEqual([normal]);
+      expect(filterCanonicalSkills(snapshot, { ...options, searchQuery: "Built-in" })).toEqual([]);
+      expect(snapshot).toEqual([normal, builtIn]);
+      expect(builtIn.isBuiltIn).toBe(true);
+    },
+  );
   it("filters an existing canonical snapshot by agent without rescanning", () => {
     const original = [...skills];
     const result = filterCanonicalSkills(skills, {

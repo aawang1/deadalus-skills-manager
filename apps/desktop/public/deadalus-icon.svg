@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="surface" x1="160" y1="96" x2="864" y2="960" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#243752"/>
+      <stop offset=".48" stop-color="#111923"/>
+      <stop offset="1" stop-color="#080D16"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0" cy="0" r="1" gradientTransform="translate(800 816) rotate(-136) scale(760 520)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3984FF" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#3984FF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="112" y1="80" x2="896" y2="944" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A2C9FF" stop-opacity=".85"/>
+      <stop offset=".42" stop-color="#487BBB" stop-opacity=".3"/>
+      <stop offset="1" stop-color="#3984FF" stop-opacity=".85"/>
+    </linearGradient>
+    <linearGradient id="letter" x1="390" y1="324" x2="642" y2="700" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DAE9FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="40" y="40" width="944" height="944" rx="260" fill="url(#surface)"/>
+  <rect x="40" y="40" width="944" height="944" rx="260" fill="url(#sheen)"/>
+  <rect x="44" y="44" width="936" height="936" rx="256" stroke="url(#edge)" stroke-width="8"/>
+  <rect x="58" y="58" width="908" height="908" rx="244" stroke="#C4DDFF" stroke-opacity=".07" stroke-width="2"/>
+  <!-- Outlined D: no runtime font dependency at any export size. -->
+  <path fill="url(#letter)" fill-rule="evenodd" d="M360 324H490C614 324 688 391 688 512S614 700 490 700H360V324ZM440 394V630H486C565 630 606 591 606 512S565 394 486 394H440Z" clip-rule="evenodd"/>
+</svg>

@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 type RawProfile = (
     String,
@@ -36,6 +36,8 @@ type RawProfile = (
     i64,
     Option<i64>,
     Option<String>,
+    String,
+    String,
 );
 
 #[derive(Debug, Error)]
@@ -104,8 +106,8 @@ impl Database {
             INSERT INTO embedding_profiles (
                 profile_id, provider, model, model_version, dimensions,
                 input_schema_version, chunk_policy_version, tokenizer,
-                credential_id, status, is_active, created_at, activated_at, error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                credential_id, status, is_active, created_at, activated_at, error, name, description
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(profile_id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
@@ -116,7 +118,9 @@ impl Database {
                 tokenizer = excluded.tokenizer,
                 credential_id = excluded.credential_id,
                 status = excluded.status,
-                error = excluded.error
+                error = excluded.error,
+                name = excluded.name,
+                description = excluded.description
             "#,
             params![
                 profile.profile_id,
@@ -133,6 +137,8 @@ impl Database {
                 profile.created_at,
                 profile.activated_at,
                 profile.error,
+                profile.name,
+                profile.description,
             ],
         )?;
         Ok(())
@@ -335,7 +341,7 @@ impl Database {
                 r#"
                 SELECT profile_id, provider, model, model_version, dimensions,
                        input_schema_version, chunk_policy_version, tokenizer,
-                       credential_id, status, is_active, created_at, activated_at, error
+                       credential_id, status, is_active, created_at, activated_at, error, name, description
                 FROM embedding_profiles
                 WHERE is_active = 1
                 "#,
@@ -356,6 +362,8 @@ impl Database {
                         row.get::<_, i64>(11)?,
                         row.get::<_, Option<i64>>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
                     ))
                 },
             )
@@ -370,7 +378,7 @@ impl Database {
                 r#"
                 SELECT profile_id, provider, model, model_version, dimensions,
                        input_schema_version, chunk_policy_version, tokenizer,
-                       credential_id, status, is_active, created_at, activated_at, error
+                       credential_id, status, is_active, created_at, activated_at, error, name, description
                 FROM embedding_profiles
                 WHERE profile_id = ?1
                 "#,
@@ -387,7 +395,7 @@ impl Database {
             r#"
             SELECT profile_id, provider, model, model_version, dimensions,
                    input_schema_version, chunk_policy_version, tokenizer,
-                   credential_id, status, is_active, created_at, activated_at, error
+                   credential_id, status, is_active, created_at, activated_at, error, name, description
             FROM embedding_profiles
             ORDER BY is_active DESC, created_at DESC, profile_id
             "#,
@@ -3099,7 +3107,7 @@ impl Database {
         let mut statement = connection.prepare(
             r#"
             SELECT category_id, name, color, description, skill_ids_json,
-                   created_at, updated_at
+                   created_at, updated_at, project_root, project_agent
             FROM custom_skill_categories
             ORDER BY lower(name), category_id
             "#,
@@ -3115,6 +3123,7 @@ impl Database {
                     )
                 })?;
                 Ok(CustomSkillCategory {
+                    shared_skill_ids: Vec::new(),
                     category_id: row.get(0)?,
                     name: row.get(1)?,
                     color: row.get(2)?,
@@ -3122,6 +3131,8 @@ impl Database {
                     skill_ids,
                     created_at: row.get(5)?,
                     updated_at: row.get(6)?,
+                    project_root: row.get(7)?,
+                    project_agent: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -3137,7 +3148,7 @@ impl Database {
             .query_row(
                 r#"
                 SELECT category_id, name, color, description, skill_ids_json,
-                       created_at, updated_at
+                       created_at, updated_at, project_root, project_agent
                 FROM custom_skill_categories
                 WHERE category_id = ?1
                 "#,
@@ -3152,6 +3163,7 @@ impl Database {
                         )
                     })?;
                     Ok(CustomSkillCategory {
+                        shared_skill_ids: Vec::new(),
                         category_id: row.get(0)?,
                         name: row.get(1)?,
                         color: row.get(2)?,
@@ -3159,6 +3171,8 @@ impl Database {
                         skill_ids,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
+                        project_root: row.get(7)?,
+                        project_agent: row.get(8)?,
                     })
                 },
             )
@@ -3174,8 +3188,8 @@ impl Database {
             r#"
             INSERT INTO custom_skill_categories (
                 category_id, name, color, description, skill_ids_json,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                created_at, updated_at, project_root, project_agent
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 category.category_id,
@@ -3185,6 +3199,8 @@ impl Database {
                 serde_json::to_string(&category.skill_ids)?,
                 category.created_at,
                 category.updated_at,
+                category.project_root,
+                category.project_agent,
             ],
         )?;
         Ok(())
@@ -3337,6 +3353,10 @@ pub struct CanonicalSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomSkillCategory {
+    #[serde(default)]
+    pub shared_skill_ids: Vec<String>,
+    pub project_root: Option<String>,
+    pub project_agent: Option<String>,
     pub category_id: String,
     pub name: String,
     pub color: String,
@@ -3444,6 +3464,16 @@ fn migrate(connection: &mut Connection) -> DatabaseResult<()> {
     }
     if version < 9 {
         migration_v9(connection.transaction()?)?;
+    }
+    if version < 10 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch("ALTER TABLE custom_skill_categories ADD COLUMN project_root TEXT; ALTER TABLE custom_skill_categories ADD COLUMN project_agent TEXT; INSERT INTO schema_version(version, applied_at) VALUES (10, unixepoch());")?;
+        transaction.commit()?;
+    }
+    if version < 11 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch("ALTER TABLE embedding_profiles ADD COLUMN name TEXT NOT NULL DEFAULT ''; ALTER TABLE embedding_profiles ADD COLUMN description TEXT NOT NULL DEFAULT ''; UPDATE embedding_profiles SET name = model WHERE name = ''; INSERT INTO schema_version(version, applied_at) VALUES (11, unixepoch());")?;
+        transaction.commit()?;
     }
     let final_version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -4056,6 +4086,8 @@ fn migration_v9(transaction: Transaction<'_>) -> DatabaseResult<()> {
 
 fn profile_from_raw(raw: RawProfile) -> DatabaseResult<EmbeddingProfile> {
     Ok(EmbeddingProfile {
+        name: raw.14,
+        description: raw.15,
         profile_id: raw.0,
         provider: raw.1,
         model: raw.2,
@@ -4160,6 +4192,8 @@ fn raw_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProfile>
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
     ))
 }
 
@@ -4226,6 +4260,8 @@ mod tests {
 
     fn profile(id: &str, status: ProfileStatus) -> EmbeddingProfile {
         EmbeddingProfile {
+            name: "Test profile".to_string(),
+            description: "Test description".to_string(),
             profile_id: id.to_string(),
             provider: "test".to_string(),
             model: "deterministic".to_string(),
@@ -4318,6 +4354,28 @@ mod tests {
     }
 
     #[test]
+    fn named_profiles_roundtrip_and_upgrade_without_changing_index_configuration() {
+        let database = Database::in_memory().unwrap();
+        let original = profile("named", ProfileStatus::Ready);
+        database.upsert_profile(&original).unwrap();
+        assert_eq!(database.profile("named").unwrap().unwrap(), original);
+        assert_eq!(database.list_profiles().unwrap()[0].description, original.description);
+        database.activate_profile_atomic("named", 2).unwrap();
+        assert_eq!(database.active_profile().unwrap().unwrap().name, original.name);
+        {
+            let mut connection = database.connection().unwrap();
+            connection.execute_batch("ALTER TABLE embedding_profiles DROP COLUMN name; ALTER TABLE embedding_profiles DROP COLUMN description; DELETE FROM schema_version WHERE version = 11;").unwrap();
+            migrate(&mut connection).unwrap();
+        }
+        let upgraded = database.profile("named").unwrap().unwrap();
+        assert_eq!(upgraded.name, original.model);
+        assert_eq!(upgraded.description, "");
+        assert_eq!(upgraded.model, original.model);
+        assert_eq!(upgraded.dimensions, original.dimensions);
+        assert!(upgraded.is_active);
+    }
+
+    #[test]
     fn canonical_snapshot_replacement_is_atomic_and_round_trips_memberships() {
         let database = Database::in_memory().unwrap();
         let first = canonical_snapshot("snapshot-1", "first");
@@ -4361,6 +4419,9 @@ mod tests {
     fn custom_skill_categories_round_trip_with_stable_membership() {
         let database = Database::in_memory().unwrap();
         let category = CustomSkillCategory {
+            shared_skill_ids: Vec::new(),
+            project_root: None,
+            project_agent: None,
             category_id: "category-visual".to_string(),
             name: "视觉工具".to_string(),
             color: "#4f8cff".to_string(),

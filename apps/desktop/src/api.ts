@@ -1,7 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getLanguage } from "./i18n";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AdaptiveHistoryRecord,
+  AgentSkillRecommendation,
   AdaptivePolicyState,
   AddSkillsToCustomCategoryResult,
   ApiKeyMetadata,
@@ -40,6 +42,8 @@ import type {
 export const isNativeRuntime = () => isTauri();
 
 export const api = {
+  translateDisplayTexts: (texts: string[], language: "zh" | "en") =>
+    invoke<string[]>("translate_display_texts", { texts, language }),
   getCanonicalSkillsSnapshot: () =>
     invoke<CanonicalSnapshot>("get_canonical_skills_snapshot"),
   refreshCanonicalSkillsSnapshot: () =>
@@ -60,6 +64,7 @@ export const api = {
     invoke<CustomSkillCategory[]>("list_custom_skill_categories"),
   createCustomSkillCategory: (request: CreateCustomSkillCategoryRequest) =>
     invoke<CustomSkillCategory>("create_custom_skill_category", { request }),
+  selectProjectDirectory: () => invoke<string | null>("select_project_directory", { language: getLanguage() }),
   deleteCustomSkillCategory: (categoryId: string) =>
     invoke<boolean>("delete_custom_skill_category", { categoryId }),
   addSkillsToCustomCategory: (categoryId: string, skillIds: string[]) =>
@@ -72,10 +77,17 @@ export const api = {
       sourceCategoryId,
       targetCategoryId,
     }),
+  replaceCustomCategoryWithSkills: (targetCategoryId: string, skillIds: string[]) =>
+    invoke<ReplaceCustomCategoryMembersResult>("replace_custom_category_with_skills", {
+      targetCategoryId,
+      skillIds,
+    }),
+  recommendAgentSkills: (viewId: string, request: string) =>
+    invoke<AgentSkillRecommendation>("recommend_agent_skills", { viewId, request }),
 
   listApiKeys: () => invoke<ApiKeyMetadata[]>("list_api_keys"),
-  saveApiKey: (provider: string, apiKey: string) =>
-    invoke<ApiKeyMetadata>("save_api_key", { provider, apiKey }),
+  saveApiKey: (provider: string, apiKey: string, purpose: CredentialPurpose) =>
+    invoke<ApiKeyMetadata>("save_api_key", { provider, apiKey, purpose }),
   deleteApiKey: (id: string) =>
     invoke<ApiKeyMetadata[]>("delete_api_key", { id }),
   activateApiKeyForPurpose: (id: string, purpose: CredentialPurpose) =>

@@ -1,4 +1,5 @@
 pub mod adaptive;
+pub mod agent_task_log;
 pub mod application;
 pub mod database;
 pub mod graph;
@@ -26,6 +27,7 @@ use adaptive::{
     initial_policy, propose_policy, AdaptivePolicyState, AdaptiveProposal,
     ADAPTIVE_POLICY_SCHEMA_VERSION,
 };
+use agent_task_log::{append_task_log, AgentLogRetrievalSettings, AgentLogSkillRef, AgentTaskLog};
 use application::{
     migrate_profile_relations, retrieve_semantic_results, AnalysisPhase, AnalysisProvider,
     AnalysisRequest, QueryVectors, RetrievalConfig,
@@ -41,8 +43,9 @@ use pipeline::{
     replace_overall_function_with_classification_summary, rule_result, ClusterSemanticRequest,
     EmbeddingJobContext, EmbeddingProvider, IndexDiff, IndexSyncStatus, JobStrategy,
     PreparedProfileChange, ProfileChangeRequest, ProgressEvent, RemoteAnalysisProvider,
-    RemoteEmbeddingProvider, ReqwestJsonTransport, SkillClassificationRequest, ToastMessage,
-    VectorizationComplexity, CLASSIFICATION_PROMPT_VERSION, CLASSIFICATION_SCHEMA_VERSION,
+    RemoteEmbeddingProvider, RequirementCategory, RequirementSkillMatch, ReqwestJsonTransport,
+    SkillClassificationRequest, ToastMessage, VectorizationComplexity,
+    CLASSIFICATION_PROMPT_VERSION, CLASSIFICATION_SCHEMA_VERSION,
 };
 use validation::{
     compute_metrics, generate_samples, split_for_family, EvaluatedSample, FeedbackAction,
@@ -63,6 +66,8 @@ const QWEN_EMBEDDING_ENDPOINT: &str =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeyMetadata {
+    #[serde(default)]
+    purpose: Option<CredentialPurpose>,
     id: String,
     provider: String,
     masked_key: String,
@@ -82,6 +87,14 @@ struct ApiKeyMetadata {
 enum CredentialPurpose {
     Agent,
     Embedding,
+}
+
+fn validate_credential_purpose(key: &ApiKeyMetadata, purpose: CredentialPurpose) -> Result<(), String> {
+    // Missing purpose denotes an existing credential with legacy shared bindings.
+    if key.purpose.is_some_and(|stored| stored != purpose) {
+        return Err("该凭据未储存用于此用途，请选择对应用途后重新保存 API Key".to_string());
+    }
+    Ok(())
 }
 
 impl CredentialPurpose {
@@ -112,10 +125,8 @@ struct ProviderModelsResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateEmbeddingProfileRequest {
-    provider: String,
-    model: String,
-    version: String,
-    dimensions: u32,
+    name: String,
+    description: String,
     credential_id: String,
 }
 
@@ -212,6 +223,7 @@ struct AgentSkillsResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateCustomSkillCategoryRequest {
+    project_root: Option<String>,
     name: String,
     color: String,
     description: String,
@@ -397,6 +409,7 @@ async fn save_api_key(
     app: AppHandle,
     provider: String,
     api_key: String,
+    purpose: CredentialPurpose,
 ) -> Result<ApiKeyMetadata, String> {
     let provider = provider.trim().to_ascii_lowercase();
     let api_key = api_key.trim();
@@ -405,6 +418,9 @@ async fn save_api_key(
         return Err("API Key 长度无效".to_string());
     }
 
+    if purpose == CredentialPurpose::Embedding && !is_embedding_provider(&provider) {
+        return Err("该 Provider 当前不支持 Embedding 用途".to_string());
+    }
     validate_api_key(&provider, api_key).await?;
 
     let saved_at = unix_timestamp()?;
@@ -416,6 +432,7 @@ async fn save_api_key(
         .map_err(|error| format!("无法保存到 Windows Credential Manager：{error}"))?;
 
     let metadata = ApiKeyMetadata {
+        purpose: Some(purpose),
         id,
         provider,
         masked_key: mask_key(api_key),
@@ -482,6 +499,7 @@ fn activate_metadata_for_purpose(
         .iter()
         .find(|key| key.id == id)
         .ok_or_else(|| "未找到该 API Key".to_string())?;
+    validate_credential_purpose(selected, purpose)?;
     if purpose == CredentialPurpose::Embedding && !is_embedding_provider(&selected.provider) {
         return Err("该 Provider 当前不支持 Embedding 用途".to_string());
     }
@@ -553,6 +571,7 @@ fn set_agent_model(
         .iter_mut()
         .find(|key| key.id == id)
         .ok_or_else(|| "未找到该 API Key".to_string())?;
+    validate_credential_purpose(key, CredentialPurpose::Agent)?;
     key.agent_model = Some(model.to_string());
     write_key_metadata(&app, &keys)?;
     Ok(keys)
@@ -569,6 +588,7 @@ async fn list_provider_models(
         .find(|key| key.id == id)
         .ok_or_else(|| "未找到该 API Key".to_string())?;
     let api_key = read_credential_secret(&id)?;
+    validate_credential_purpose(key, CredentialPurpose::Agent)?;
     let models = fetch_provider_models(&key.provider, &api_key).await?;
     Ok(ProviderModelsResponse {
         credential_id: id,
@@ -703,6 +723,7 @@ fn validate_embedding_credential_by_id(
         .iter()
         .find(|key| key.id == credential_id)
         .ok_or_else(|| "Embedding Profile 引用的凭据不存在".to_string())?;
+    validate_credential_purpose(credential, CredentialPurpose::Embedding)?;
     if require_active && !credential.is_embedding_active {
         return Err("该凭据未启用 Embedding 用途".to_string());
     }
@@ -750,45 +771,44 @@ fn create_embedding_profile(
     database: State<'_, Database>,
     request: CreateEmbeddingProfileRequest,
 ) -> Result<EmbeddingProfile, String> {
-    let provider = request.provider.trim().to_ascii_lowercase();
-    let model = request.model.trim();
-    let version = request.version.trim();
-    if model.is_empty() || model.len() > 200 {
-        return Err("Embedding 模型名称无效".to_string());
-    }
-    if version.is_empty() || version.len() > 100 {
-        return Err("Embedding 模型版本无效".to_string());
-    }
-    if request.dimensions == 0 || request.dimensions > 65_536 {
-        return Err("Embedding 维度无效".to_string());
-    }
-    embedding_profile_defaults(&provider)?;
     let keys = read_key_metadata(&app)?;
-    validate_embedding_credential(&provider, &request.credential_id, &keys)?;
+    let profile = named_embedding_profile(&request, &keys, unix_timestamp_i64()?)?;
     read_credential_secret(&request.credential_id)?;
-    let created_at =
-        i64::try_from(unix_timestamp()?).map_err(|_| "Profile 时间超出支持范围".to_string())?;
-    let profile = EmbeddingProfile {
+    database
+        .upsert_profile(&profile)
+        .map_err(|error| format!("无法创建 Embedding Profile：{error}"))?;
+    ensure_adaptive_policy(database.inner(), &profile, profile.created_at)?;
+    Ok(profile)
+}
+
+fn named_embedding_profile(request: &CreateEmbeddingProfileRequest, keys: &[ApiKeyMetadata], created_at: i64) -> Result<EmbeddingProfile, String> {
+    let name = request.name.trim();
+    let description = request.description.trim();
+    if name.is_empty() || name.chars().count() > 100 || description.chars().count() > 1000 {
+        return Err("Profile 名称须为 1–100 字，简介不得超过 1000 字".to_string());
+    }
+    let key = keys.iter().find(|key| key.id == request.credential_id)
+        .ok_or_else(|| "Embedding 凭据不存在".to_string())?;
+    validate_embedding_credential(&key.provider, &key.id, keys)?;
+    let defaults = embedding_profile_defaults(&key.provider)?;
+    Ok(EmbeddingProfile {
+        name: name.to_string(),
+        description: description.to_string(),
         profile_id: Uuid::new_v4().to_string(),
-        provider,
-        model: model.to_string(),
-        model_version: version.to_string(),
-        dimensions: request.dimensions,
+        provider: defaults.provider,
+        model: defaults.model,
+        model_version: defaults.version,
+        dimensions: defaults.dimensions,
         input_schema_version: INPUT_SCHEMA_VERSION.to_string(),
         chunk_policy_version: CHUNK_POLICY_VERSION.to_string(),
         tokenizer: None,
-        credential_id: Some(request.credential_id),
+        credential_id: Some(request.credential_id.clone()),
         status: ProfileStatus::Draft,
         is_active: false,
         created_at,
         activated_at: None,
         error: None,
-    };
-    database
-        .upsert_profile(&profile)
-        .map_err(|error| format!("无法创建 Embedding Profile：{error}"))?;
-    ensure_adaptive_policy(database.inner(), &profile, created_at)?;
-    Ok(profile)
+    })
 }
 
 #[tauri::command]
@@ -1166,6 +1186,8 @@ fn preflight_profile_for_request(
     let defaults = embedding_profile_defaults(&provider)?;
     Ok(EmbeddingProfile {
         profile_id: "preflight-only".to_string(),
+        name: String::new(),
+        description: String::new(),
         provider,
         model: request.model.clone().unwrap_or(defaults.model),
         model_version: defaults.version,
@@ -1571,6 +1593,8 @@ fn clone_profile_for_rebuild(
     created_at: i64,
 ) -> EmbeddingProfile {
     EmbeddingProfile {
+        name: source.name.clone(),
+        description: source.description.clone(),
         profile_id: Uuid::new_v4().to_string(),
         provider: source.provider.clone(),
         model: source.model.clone(),
@@ -1715,6 +1739,8 @@ fn stage_embedding_job_target(
     }
     let profile = EmbeddingProfile {
         profile_id: Uuid::new_v4().to_string(),
+        name: model.clone(),
+        description: String::new(),
         provider,
         model,
         model_version: defaults.version,
@@ -1985,6 +2011,375 @@ async fn semantic_search(
     .map_err(|error| format!("语义检索失败：{error}"))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSkillRecommendation {
+    view_id: String,
+    summary: String,
+    results: Vec<SearchResult>,
+    warnings: Vec<String>,
+}
+
+#[tauri::command]
+async fn recommend_agent_skills(
+    app: AppHandle,
+    database: State<'_, Database>,
+    view_id: String,
+    request: String,
+) -> Result<AgentSkillRecommendation, String> {
+    let mut log = AgentTaskLog::new(request.clone(), view_id.clone());
+    let log_dir = app.path().app_data_dir();
+    if let Ok(ref directory) = log_dir {
+        if let Err(error) = append_task_log(directory, &log) {
+            eprintln!("无法写入 Agent 任务开始日志：{error}");
+        }
+    }
+    let outcome =
+        recommend_agent_skills_inner(&app, database.inner(), &view_id, &request, &mut log).await;
+    let log_result = outcome
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| redact_task_log_error(&app, error));
+    log.finish(&log_result);
+    if let Ok(ref directory) = log_dir {
+        if let Err(error) = append_task_log(directory, &log) {
+            eprintln!("无法写入 Agent 任务结束日志：{error}");
+        }
+    } else if let Err(error) = log_dir {
+        eprintln!("无法确定 Agent 任务日志目录：{error}");
+    }
+    outcome
+}
+
+fn redact_task_log_error(app: &AppHandle, error: &str) -> String {
+    let mut safe = error.chars().take(4000).collect::<String>();
+    if let Ok(keys) = read_key_metadata(app) {
+        for key in keys {
+            if let Ok(secret) = read_credential_secret(&key.id) {
+                if secret.len() >= 8 {
+                    safe = safe.replace(&secret, "[REDACTED KEY]");
+                }
+            }
+        }
+    }
+    safe
+}
+
+async fn recommend_agent_skills_inner(
+    app: &AppHandle,
+    database: &Database,
+    view_id: &str,
+    request: &str,
+    log: &mut AgentTaskLog,
+) -> Result<AgentSkillRecommendation, String> {
+    log.phase = "validate_request".to_string();
+    let request = request.trim();
+    if request.is_empty() || request.chars().count() > 6000 {
+        return Err("请输入 1–6000 字的需求。".to_string());
+    }
+    // The graph is the authoritative visible set, including profile/readiness and category filters.
+    log.phase = "load_visible_graph".to_string();
+    let graph = skill_graph_for_view(database, view_id)?;
+    log.graph_version = Some(graph.graph_version.clone());
+    if graph.nodes.is_empty() {
+        return Err("当前可视化类别没有可检索的就绪 Skill 节点。".to_string());
+    }
+    let allowed = graph
+        .nodes
+        .iter()
+        .filter(|node| !node.disabled)
+        .map(|node| node.skill_id.clone())
+        .collect::<HashSet<_>>();
+    log.eligible_skills = graph
+        .nodes
+        .iter()
+        .filter(|node| allowed.contains(&node.skill_id))
+        .map(|node| AgentLogSkillRef {
+            skill_id: node.skill_id.clone(),
+            name: node.name.clone(),
+        })
+        .collect();
+    if allowed.is_empty() {
+        return Err("当前可视化类别没有启用且就绪的 Skill 节点。".to_string());
+    }
+    log.phase = "analyze_request".to_string();
+    let analysis = active_analysis_provider(app)?;
+    log.analysis_provider = Some(analysis.provider.clone());
+    log.analysis_model = Some(analysis.model.clone());
+    let requirement_analysis = analysis
+        .analyze_agent_skill_request(request)
+        .await
+        .map_err(|error| format!("Agent 需求分析失败：{error}"))?;
+    log.analysis_summary = Some(requirement_analysis.summary.clone());
+    log.search_query = Some(requirement_analysis.search_query.clone());
+    log.requirement_analysis = serde_json::to_value(&requirement_analysis).ok();
+    log.phase = "load_embedding_profile".to_string();
+    let profile = database
+        .active_profile()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "尚无活动 Embedding Profile。".to_string())?;
+    log.embedding_profile_id = Some(profile.profile_id.clone());
+    log.embedding_provider = Some(profile.provider.clone());
+    log.embedding_model = Some(profile.model.clone());
+    let classifications = database
+        .classifications_for_profile(&profile.profile_id)
+        .map_err(|error| format!("无法读取活动 Profile 的 Skill 分类：{error}"))?
+        .into_iter()
+        .filter(|item| {
+            allowed.contains(&item.skill_id)
+                && item.status == application::SemanticRecordStatus::Ready
+                && !item.broad_category.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    log.phase = "match_requirement_categories".to_string();
+    let category_matches = analysis
+        .match_requirement_categories(&requirement_analysis, &classifications)
+        .await
+        .map_err(|error| format!("需求大类与 Skill 大类匹配失败：{error}"))?;
+    log.category_matches = serde_json::to_value(&category_matches).ok();
+    let matched_broad_categories = category_matches
+        .iter()
+        .flat_map(|item| item.matched_skill_broad_categories.iter())
+        .collect::<HashSet<_>>();
+    let category_candidates = classifications
+        .iter()
+        .filter(|item| matched_broad_categories.contains(&item.broad_category))
+        .cloned()
+        .collect::<Vec<_>>();
+    log.phase = "match_requirement_small_categories".to_string();
+    let skill_match_report = analysis
+        .match_skills_to_requirements(&requirement_analysis, &category_candidates)
+        .await
+        .map_err(|error| format!("需求小类与 Skill 功能匹配失败：{error}"))?;
+    log.skill_matches = serde_json::to_value(&skill_match_report).ok();
+    let warnings = skill_match_report
+        .failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "候选分析第 {}/{} 组失败（{} 个 Skills）：{}",
+                failure.group_index, failure.group_count, failure.candidate_count, failure.reason
+            )
+        })
+        .collect::<Vec<_>>();
+    let skill_matches = skill_match_report.matches;
+    let credential_id = profile
+        .credential_id
+        .as_deref()
+        .ok_or_else(|| "活动 Profile 没有 Embedding 凭据。".to_string())?;
+    validate_embedding_credential(&profile.provider, credential_id, &read_key_metadata(app)?)?;
+    let key = read_credential_secret(credential_id)?;
+    log.phase = "embed_query".to_string();
+    let types = VectorType::ALL.to_vec();
+    let mut query_specs = requirement_analysis
+        .categories
+        .iter()
+        .map(|category| {
+            (
+                category.category_id.clone(),
+                requirement_category_query(category),
+            )
+        })
+        .collect::<Vec<_>>();
+    query_specs.push((
+        "__global__".to_string(),
+        requirement_analysis.search_query.clone(),
+    ));
+    let texts = query_specs
+        .iter()
+        .flat_map(|(_, query)| {
+            types
+                .iter()
+                .map(move |kind| format!("type: {kind}\nquery: {query}"))
+        })
+        .collect::<Vec<_>>();
+    let batch = RemoteEmbeddingProvider::new(&profile, key, ReqwestJsonTransport)
+        .embed(&texts)
+        .await
+        .map_err(|error| format!("需求检索向量生成失败：{error}"))?;
+    if batch.vectors.len() != query_specs.len() * types.len() {
+        return Err("Embedding Provider 返回的需求向量数量不完整。".to_string());
+    }
+    let query_vectors = query_specs
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| {
+            let start = index * types.len();
+            let vectors = types
+                .iter()
+                .copied()
+                .zip(batch.vectors[start..start + types.len()].iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            (
+                id.clone(),
+                QueryVectors {
+                    profile_id: profile.profile_id.clone(),
+                    vectors,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let vectors = database
+        .load_vectors(&profile.profile_id)
+        .map_err(|error| format!("无法读取活动 Profile 向量：{error}"))?;
+    log.phase = "retrieve_category_scoped_skills".to_string();
+    let config = RetrievalConfig {
+        parent_pool_min: allowed.len(),
+        parent_pool_max: allowed.len(),
+        parent_min_score: -1.0,
+        final_min_score: -1.0,
+        score_gap: 2.0,
+        max_final_results: allowed.len(),
+        ..RetrievalConfig::default()
+    };
+    log.retrieval_settings = Some(AgentLogRetrievalSettings {
+        parent_pool_min: config.parent_pool_min,
+        parent_pool_max: config.parent_pool_max,
+        parent_min_score: config.parent_min_score,
+        final_min_score: config.final_min_score,
+        score_gap: config.score_gap,
+        max_final_results: config.max_final_results,
+        category_fit_weight: 0.8,
+        vector_fit_weight: 0.2,
+        global_rescue_threshold: 0.5,
+    });
+    let mut category_vector_results = HashMap::<String, SearchResult>::new();
+    for category in &requirement_analysis.categories {
+        let category_allowed = skill_matches
+            .iter()
+            .filter(|item| {
+                item.requirement_category_ids
+                    .contains(&category.category_id)
+            })
+            .map(|item| item.skill_id.clone())
+            .collect::<HashSet<_>>();
+        if category_allowed.is_empty() {
+            continue;
+        }
+        let Some(query) = query_vectors.get(&category.category_id) else {
+            continue;
+        };
+        let mut scoped_config = config.clone();
+        scoped_config.parent_pool_min = category_allowed.len();
+        scoped_config.parent_pool_max = category_allowed.len();
+        scoped_config.max_final_results = category_allowed.len();
+        for result in
+            retrieve_semantic_results(query, &vectors, Some(&category_allowed), &scoped_config)
+                .map_err(|error| format!("需求分类向量微调失败：{error}"))?
+        {
+            let replace = category_vector_results
+                .get(&result.skill_id)
+                .is_none_or(|current| result.score > current.score);
+            if replace {
+                category_vector_results.insert(result.skill_id.clone(), result);
+            }
+        }
+    }
+    log.phase = "retrieve_global_vector_rescue".to_string();
+    let global_config = RetrievalConfig {
+        parent_pool_min: allowed.len(),
+        parent_pool_max: allowed.len(),
+        parent_min_score: 0.5,
+        final_min_score: 0.5,
+        score_gap: 2.0,
+        max_final_results: allowed.len(),
+        chunks_per_skill: 0,
+        chunk_weight: 0.0,
+        supplementary_chunk_min_score: 2.0,
+        ..RetrievalConfig::default()
+    };
+    let global_query = query_vectors
+        .get("__global__")
+        .ok_or_else(|| "缺少全局需求查询向量。".to_string())?;
+    let global_results =
+        retrieve_semantic_results(global_query, &vectors, Some(&allowed), &global_config)
+            .map_err(|error| format!("全局高相似向量补充失败：{error}"))?;
+    let (results, result_sources) = combine_requirement_results(
+        &skill_matches,
+        category_vector_results.into_values().collect(),
+        global_results,
+    );
+    log.result_sources = serde_json::to_value(&result_sources).ok();
+    log.result_names = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            results
+                .iter()
+                .any(|result| result.skill_id == node.skill_id)
+        })
+        .map(|node| AgentLogSkillRef {
+            skill_id: node.skill_id.clone(),
+            name: node.name.clone(),
+        })
+        .collect();
+    log.results = results.clone();
+    Ok(AgentSkillRecommendation {
+        view_id: view_id.to_string(),
+        summary: requirement_analysis.summary,
+        results,
+        warnings,
+    })
+}
+
+fn requirement_category_query(category: &RequirementCategory) -> String {
+    format!(
+        "broad category: {}\nsmall categories: {}\ntarget object: {}\nuser goal: {}\ncapability: {}\nworkflow: {}",
+        category.broad_category,
+        category.small_categories.join(", "),
+        category.target_object,
+        category.user_goal,
+        category.capability_summary,
+        category.workflow_summary,
+    )
+}
+
+fn combine_requirement_results(
+    skill_matches: &[RequirementSkillMatch],
+    category_results: Vec<SearchResult>,
+    global_results: Vec<SearchResult>,
+) -> (Vec<SearchResult>, BTreeMap<String, Vec<String>>) {
+    let match_by_skill = skill_matches
+        .iter()
+        .map(|item| (item.skill_id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    let mut sources = BTreeMap::<String, Vec<String>>::new();
+    let mut by_skill = HashMap::<String, SearchResult>::new();
+    for mut result in category_results {
+        let Some(skill_match) = match_by_skill.get(result.skill_id.as_str()) else {
+            continue;
+        };
+        result.score = skill_match.fit_score * 0.8 + result.score.clamp(0.0, 1.0) * 0.2;
+        sources
+            .entry(result.skill_id.clone())
+            .or_default()
+            .push("category_match".to_string());
+        by_skill.insert(result.skill_id.clone(), result);
+    }
+    for result in global_results {
+        sources
+            .entry(result.skill_id.clone())
+            .or_default()
+            .push("global_cosine_over_0.50".to_string());
+        by_skill
+            .entry(result.skill_id.clone())
+            .and_modify(|current| {
+                if result.score > current.score {
+                    *current = result.clone();
+                }
+            })
+            .or_insert(result);
+    }
+    let mut results = by_skill.into_values().collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.skill_id.cmp(&right.skill_id))
+    });
+    (results, sources)
+}
+
 #[tauri::command]
 fn list_skill_relations(
     database: State<'_, Database>,
@@ -2002,11 +2397,224 @@ fn list_custom_skill_categories(
 ) -> Result<Vec<CustomSkillCategory>, String> {
     database
         .list_custom_skill_categories()
-        .map_err(|error| format!("无法读取自定义类别：{error}"))
+        .map_err(|error| format!("无法读取自定义类别：{error}"))?
+        .into_iter()
+        .map(|category| {
+            project_category_members(&database, category.clone()).or_else(|_| {
+                let mut unavailable = category;
+                unavailable.skill_ids.clear();
+                unavailable.shared_skill_ids.clear();
+                Ok(unavailable)
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn select_project_directory(language: Option<String>) -> Result<Option<String>, String> {
+    Ok(rfd::AsyncFileDialog::new()
+        .set_title(if language.as_deref() == Some("en") {
+            "Choose project root folder"
+        } else {
+            "选择项目根目录文件夹"
+        })
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_string_lossy().into_owned()))
+}
+
+fn validate_project_root(value: &str) -> Result<String, String> {
+    let root = fs::canonicalize(value).map_err(|e| format!("项目目录不可用：{e}"))?;
+    if !root.is_dir() || root.parent().is_none() {
+        return Err("请选择具体项目文件夹。".into());
+    }
+    Ok(root.to_string_lossy().into_owned())
+}
+
+fn scan_project_skills(root: &str) -> Result<Vec<InstalledSkill>, String> {
+    let root = PathBuf::from(validate_project_root(root)?);
+    let mut skills = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+    for directory in [".agents", ".claude", ".cursor", ".codex"] {
+        let path = root.join(directory).join("skills");
+        if path.exists() && !is_within(&path, &root) {
+            return Err(format!("项目 Skills 目录指向项目外部：{}", path.display()));
+        }
+        scan_skill_root(
+            &path,
+            &mut skills,
+            &mut warnings,
+            &mut seen,
+            "project",
+            false,
+            None,
+            false,
+        );
+    }
+    if !warnings.is_empty() {
+        return Err(warnings.join("\n"));
+    }
+    Ok(skills)
+}
+
+fn project_category_members(
+    database: &Database,
+    mut category: CustomSkillCategory,
+) -> Result<CustomSkillCategory, String> {
+    if let Some(root) = &category.project_root {
+        // An unavailable project must never fall back to the global collection.
+        let scanned = scan_project_skills(root)?;
+        let snapshot = database
+            .current_canonical_snapshot()
+            .map_err(|e| e.to_string())?;
+        let canonical = snapshot
+            .into_iter()
+            .flat_map(|s| s.skills)
+            .collect::<Vec<_>>();
+        category.shared_skill_ids = canonical
+            .iter()
+            .filter(|skill| {
+                scanned.iter().any(|local| {
+                    local.content_hash == skill.content_hash
+                        && !Path::new(&local.path)
+                            .starts_with(Path::new(root).join(".cursor").join("skills"))
+                })
+            })
+            .map(|skill| skill.skill_id.clone())
+            .collect();
+        category.skill_ids = canonical
+            .into_iter()
+            .filter(|skill| {
+                scanned
+                    .iter()
+                    .any(|local| local.content_hash == skill.content_hash)
+            })
+            .map(|skill| skill.skill_id)
+            .collect();
+        category.skill_ids.sort();
+        category.skill_ids.dedup();
+    }
+    Ok(category)
+}
+
+fn deploy_project_members(
+    database: &Database,
+    category: &CustomSkillCategory,
+    ids: &[String],
+    overwrite: bool,
+) -> Result<(), String> {
+    let Some(root) = &category.project_root else {
+        return Ok(());
+    };
+    let root = PathBuf::from(validate_project_root(root)?);
+    let target_roots = [root.join(".agents/skills"), root.join(".claude/skills")];
+    for target_root in &target_roots {
+        for ancestor in target_root.ancestors().take_while(|path| *path != root) {
+            if ancestor.exists() && !is_within(ancestor, &root) {
+                return Err("项目目标路径越过根目录边界。".into());
+            }
+        }
+    }
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|e| e.to_string())?
+        .ok_or("尚无 Skills 快照")?;
+    let desired = ids
+        .iter()
+        .map(|id| {
+            snapshot
+                .skills
+                .iter()
+                .find(|s| &s.skill_id == id && !s.is_built_in)
+                .ok_or_else(|| format!("Skill 不存在或为内置项：{id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let existing = scan_project_skills(root.to_str().ok_or("项目路径无效")?)?;
+    // Stage complete packages first. Nothing in a global Agent directory is modified.
+    let staging = root
+        .join(".deadalus")
+        .join("project-copy")
+        .join(Uuid::new_v4().to_string());
+    for ancestor in staging.ancestors().take_while(|path| *path != root) {
+        if ancestor.exists() && !is_within(ancestor, &root) {
+            return Err("项目恢复目录指向项目外部。".into());
+        }
+    }
+    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    if !is_within(&staging, &root) {
+        return Err("项目暂存目录越过根目录边界。".into());
+    }
+    let mut additions = Vec::new();
+    for (root_index, target_root) in target_roots.iter().enumerate() {
+        for skill in &desired {
+            if existing.iter().any(|s| {
+                s.content_hash == skill.content_hash && Path::new(&s.path).starts_with(target_root)
+            }) {
+                continue;
+            }
+            let source = Path::new(skill.library_path.as_deref().unwrap_or(&skill.path));
+            let package_name = source.file_name().ok_or("Skill 目录名无效")?;
+            let target = target_root.join(package_name);
+            if target.exists()
+                && (!overwrite
+                    || !existing.iter().any(|local| {
+                        Path::new(&local.path) == target
+                            && !desired.iter().any(|s| s.content_hash == local.content_hash)
+                    }))
+            {
+                return Err(format!(
+                    "项目中存在同名但内容不同的 Skill：{}",
+                    target.display()
+                ));
+            }
+            let staged = staging.join(format!("add-{root_index}-{}", additions.len()));
+            copy_directory(source, &staged)?;
+            additions.push((staged, target));
+        }
+    }
+    for target_root in &target_roots {
+        fs::create_dir_all(target_root).map_err(|e| e.to_string())?;
+    }
+    let mut moved = Vec::new();
+    let result = (|| -> Result<(), String> {
+        for (index, skill) in existing.iter().enumerate() {
+            if !overwrite {
+                continue;
+            }
+            if desired.iter().any(|s| s.content_hash == skill.content_hash) {
+                continue;
+            }
+            let source = PathBuf::from(&skill.path);
+            if !is_within(&source, &root) {
+                return Err("Skill 路径越过项目边界。".into());
+            }
+            let backup = staging.join(format!("removed-{index}"));
+            fs::rename(&source, &backup)
+                .map_err(|e| format!("保留项目 Skill 恢复副本失败：{e}"))?;
+            moved.push((source, backup));
+        }
+        for (source, target) in additions {
+            fs::rename(&source, &target).map_err(|e| format!("部署项目 Skill 失败：{e}"))?;
+            moved.push((source, target));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let mut failures = Vec::new();
+        for (original, current) in moved.into_iter().rev() {
+            if let Err(e) = fs::rename(&current, &original) {
+                failures.push(e.to_string());
+            }
+        }
+        return Err(format!("{error}；回退错误：{}", failures.join("；")));
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn create_custom_skill_category(
+    app: AppHandle,
     database: State<'_, Database>,
     request: CreateCustomSkillCategoryRequest,
 ) -> Result<CustomSkillCategory, String> {
@@ -2025,13 +2633,20 @@ fn create_custom_skill_category(
         return Err("类别标志颜色无效。".to_string());
     }
 
+    let project_root = request
+        .project_root
+        .as_deref()
+        .map(validate_project_root)
+        .transpose()?;
+    if let Some(root) = &project_root {
+        scan_project_skills(root)?;
+    }
     let snapshot = database
         .current_canonical_snapshot()
-        .map_err(|error| format!("无法读取规范快照：{error}"))?
-        .ok_or_else(|| "尚无可用的 Skills 快照。".to_string())?;
+        .map_err(|error| format!("无法读取规范快照：{error}"))?;
     let available = snapshot
-        .skills
         .iter()
+        .flat_map(|snapshot| snapshot.skills.iter())
         .filter(|skill| !skill.is_built_in)
         .map(|skill| skill.skill_id.as_str())
         .collect::<HashSet<_>>();
@@ -2042,12 +2657,15 @@ fn create_custom_skill_category(
         .collect::<Vec<_>>();
     skill_ids.sort();
     skill_ids.dedup();
-    if skill_ids.is_empty() {
+    if skill_ids.is_empty() && project_root.is_none() {
         return Err("请至少选择一个当前存在的 Skill。".to_string());
     }
 
     let now = unix_timestamp_i64()?;
     let category = CustomSkillCategory {
+        shared_skill_ids: Vec::new(),
+        project_agent: project_root.as_ref().map(|_| "codex".to_string()),
+        project_root,
         category_id: format!("category_{}", Uuid::new_v4().simple()),
         name: name.to_string(),
         color: request.color,
@@ -2059,6 +2677,23 @@ fn create_custom_skill_category(
     database
         .create_custom_skill_category(&category)
         .map_err(|error| format!("无法创建自定义类别：{error}"))?;
+    if category.project_root.is_some() {
+        let result = (|| {
+            let snapshot = build_canonical_snapshot(&app, &database)?;
+            database
+                .replace_canonical_snapshot(&snapshot)
+                .map_err(|e| e.to_string())?;
+            let resolved = project_category_members(&database, category.clone())?;
+            deploy_project_members(&database, &resolved, &resolved.skill_ids, false)?;
+            project_category_members(&database, resolved)
+        })();
+        if result.is_err() {
+            database
+                .delete_custom_skill_category(&category.category_id)
+                .map_err(|e| format!("项目创建失败且记录回退失败：{e}"))?;
+        }
+        return result;
+    }
     Ok(category)
 }
 
@@ -2085,6 +2720,7 @@ fn add_skills_to_custom_category(
         .custom_skill_category(&category_id)
         .map_err(|error| format!("无法读取目标类别：{error}"))?
         .ok_or_else(|| format!("目标类别不存在：{category_id}"))?;
+    category = project_category_members(&database, category)?;
     let snapshot = database
         .current_canonical_snapshot()
         .map_err(|error| format!("无法读取规范快照：{error}"))?
@@ -2108,7 +2744,8 @@ fn add_skills_to_custom_category(
     let added_count = merged.len().saturating_sub(before);
     let skipped_count = requested_count.saturating_sub(added_count);
     let updated_at = unix_timestamp_i64()?;
-    if added_count > 0 {
+    if added_count > 0 || category.project_root.is_some() {
+        deploy_project_members(&database, &category, &merged, false)?;
         let updated = database
             .update_custom_skill_category_members(&category_id, &merged, updated_at)
             .map_err(|error| format!("无法更新目标类别：{error}"))?;
@@ -2142,6 +2779,8 @@ fn replace_custom_category_members(
         .custom_skill_category(&target_category_id)
         .map_err(|error| format!("无法读取目标类别：{error}"))?
         .ok_or_else(|| format!("目标类别不存在：{target_category_id}"))?;
+    let source = project_category_members(&database, source)?;
+    target = project_category_members(&database, target)?;
 
     let source_members = source.skill_ids.into_iter().collect::<HashSet<_>>();
     let target_members = target.skill_ids.iter().cloned().collect::<HashSet<_>>();
@@ -2151,7 +2790,8 @@ fn replace_custom_category_members(
     let mut replacement = source_members.into_iter().collect::<Vec<_>>();
     replacement.sort();
 
-    if target.skill_ids != replacement {
+    if target.skill_ids != replacement || target.project_root.is_some() {
+        deploy_project_members(&database, &target, &replacement, true)?;
         let updated_at = unix_timestamp_i64()?;
         let updated = database
             .update_custom_skill_category_members(&target_category_id, &replacement, updated_at)
@@ -2172,10 +2812,62 @@ fn replace_custom_category_members(
 }
 
 #[tauri::command]
+fn replace_custom_category_with_skills(
+    database: State<'_, Database>,
+    target_category_id: String,
+    skill_ids: Vec<String>,
+) -> Result<ReplaceCustomCategoryMembersResult, String> {
+    let mut target = database
+        .custom_skill_category(&target_category_id)
+        .map_err(|error| format!("无法读取目标类别：{error}"))?
+        .ok_or_else(|| format!("目标类别不存在：{target_category_id}"))?;
+    target = project_category_members(&database, target)?;
+    let snapshot = database
+        .current_canonical_snapshot()
+        .map_err(|error| format!("无法读取规范快照：{error}"))?
+        .ok_or_else(|| "尚无可用的 Skills 快照。".to_string())?;
+    let eligible = snapshot
+        .skills
+        .iter()
+        .filter(|skill| !skill.is_built_in)
+        .map(|skill| skill.skill_id.as_str())
+        .collect::<HashSet<_>>();
+    if skill_ids.iter().any(|id| !eligible.contains(id.as_str())) {
+        return Err("待复制的 Skills 含不存在或内置项，请重新检索。".to_string());
+    }
+    let source = skill_ids.into_iter().collect::<HashSet<_>>();
+    let current = target.skill_ids.iter().cloned().collect::<HashSet<_>>();
+    let added_count = source.difference(&current).count();
+    let removed_count = current.difference(&source).count();
+    let unchanged_count = source.intersection(&current).count();
+    let mut replacement = source.into_iter().collect::<Vec<_>>();
+    replacement.sort();
+    if target.skill_ids != replacement || target.project_root.is_some() {
+        deploy_project_members(&database, &target, &replacement, true)?;
+        let updated_at = unix_timestamp_i64()?;
+        database
+            .update_custom_skill_category_members(&target_category_id, &replacement, updated_at)
+            .map_err(|error| format!("无法覆盖目标类别：{error}"))?;
+        target.skill_ids = replacement;
+        target.updated_at = updated_at;
+    }
+    Ok(ReplaceCustomCategoryMembersResult {
+        category: target,
+        added_count,
+        removed_count,
+        unchanged_count,
+    })
+}
+
+#[tauri::command]
 fn get_skill_graph(
     database: State<'_, Database>,
     view_id: String,
 ) -> Result<SkillGraphSnapshot, String> {
+    skill_graph_for_view(database.inner(), &view_id)
+}
+
+fn skill_graph_for_view(database: &Database, view_id: &str) -> Result<SkillGraphSnapshot, String> {
     let custom_category = if let Some(category_id) = view_id.strip_prefix("custom:") {
         Some(
             database
@@ -2186,22 +2878,20 @@ fn get_skill_graph(
     } else {
         None
     };
-    if custom_category.is_none()
-        && !matches!(view_id.as_str(), "all" | "claude-code" | "cursor" | "codex")
-    {
+    if custom_category.is_none() && !matches!(view_id, "all" | "claude-code" | "cursor" | "codex") {
         return Err(format!("未知 Skills 分类：{view_id}"));
     }
     let Some(profile) = database
         .active_profile()
         .map_err(|error| format!("无法读取活动 Profile：{error}"))?
     else {
-        return Ok(empty_graph(&view_id));
+        return Ok(empty_graph(view_id));
     };
     let Some(snapshot) = database
         .current_canonical_snapshot()
         .map_err(|error| format!("无法读取规范快照：{error}"))?
     else {
-        let mut graph = empty_graph(&view_id);
+        let mut graph = empty_graph(view_id);
         graph.profile_id = Some(profile.profile_id);
         graph.graph_version = format!(
             "no-canonical-snapshot:{}",
@@ -2210,8 +2900,9 @@ fn get_skill_graph(
         graph.layout_version = graph.graph_version.clone();
         return Ok(graph);
     };
-    let mut snapshot = snapshot_for_embedding(database.inner(), &snapshot)?;
+    let mut snapshot = snapshot_for_embedding(database, &snapshot)?;
     if let Some(category) = &custom_category {
+        let category = project_category_members(database, category.clone())?;
         let member_ids = category.skill_ids.iter().collect::<HashSet<_>>();
         snapshot
             .skills
@@ -2236,7 +2927,7 @@ fn get_skill_graph(
         &relationships,
         &classifications,
         &cluster_semantics,
-        &view_id,
+        view_id,
     ))
 }
 
@@ -3392,12 +4083,10 @@ fn active_analysis_provider(
     app: &AppHandle,
 ) -> Result<RemoteAnalysisProvider<ReqwestJsonTransport>, String> {
     let keys = read_key_metadata(app)?;
-    let Some(key) = keys.iter().find(|key| key.is_agent_active) else {
+    let Some(key) = keys.iter().find(|key| key.is_agent_active && key.purpose != Some(CredentialPurpose::Embedding)) else {
         return Err("向量化需要当前启用的 Agent API Key 进行 Skill 分类".to_string());
     };
-    let Some(model) = key.agent_model.clone() else {
-        return Err("当前 Agent API Key 尚未选择可用的分析模型".to_string());
-    };
+    let model = analysis_model_for_credential(key)?;
     let api_key = read_credential_secret(&key.id)?;
     Ok(RemoteAnalysisProvider::new(
         key.provider.clone(),
@@ -3405,6 +4094,22 @@ fn active_analysis_provider(
         api_key,
         ReqwestJsonTransport,
     ))
+}
+
+fn analysis_model_for_credential(key: &ApiKeyMetadata) -> Result<String, String> {
+    validate_credential_purpose(key, CredentialPurpose::Agent)?;
+    // Respect the model selected on the Agent credential, otherwise choose a
+    // provider-specific text/structured-output model, never an embedding model.
+    if let Some(model) = key.agent_model.as_deref().filter(|model| !model.trim().is_empty()) {
+        return Ok(model.trim().to_string());
+    }
+    match key.provider.as_str() {
+        "openai" => Ok("gpt-4.1-mini".to_string()),
+        "qwen" => Ok("qwen-plus".to_string()),
+        "anthropic" => Ok("claude-sonnet-4-6".to_string()),
+        "deepseek" => Ok("deepseek-flash".to_string()),
+        _ => Err("该服务商尚无自动 LLM 分析模型配置".to_string()),
+    }
 }
 
 fn classification_content(inputs: &[vectorization::GeneratedInput], max_chars: usize) -> String {
@@ -4351,6 +5056,23 @@ fn build_canonical_snapshot(
         }
     }
 
+    for category in database
+        .list_custom_skill_categories()
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(root) = category.project_root {
+            match scan_project_skills(&root) {
+                Ok(skills) => {
+                    for skill in skills {
+                        agent_skills.push(skill.clone());
+                        merge_skill(&mut merged, skill);
+                    }
+                }
+                Err(error) => warnings.push(format!("项目 {}：{error}", category.name)),
+            }
+        }
+    }
+
     let current_agent_skill_ids = agent_skills
         .iter()
         .map(|skill| skill.skill_id.clone())
@@ -4774,6 +5496,24 @@ fn load_or_refresh_canonical_snapshot(
     database: &Database,
 ) -> Result<CanonicalSnapshot, String> {
     get_or_build_canonical_snapshot(database, || build_canonical_snapshot(app, database))
+}
+
+#[tauri::command]
+async fn translate_display_texts(
+    app: AppHandle,
+    texts: Vec<String>,
+    language: String,
+) -> Result<Vec<String>, String> {
+    if !matches!(language.as_str(), "zh" | "en")
+        || texts.is_empty()
+        || texts.len() > 12
+        || texts.iter().map(|s| s.chars().count()).sum::<usize>() > 24000
+    {
+        return Err("Invalid display translation request".into());
+    }
+    active_analysis_provider(&app)?
+        .translate_display_texts(&texts, &language)
+        .await
 }
 
 fn apply_display_skill_summaries(
@@ -5630,14 +6370,18 @@ pub fn run() {
             start_embedding_job,
             cancel_embedding_job,
             semantic_search,
+            recommend_agent_skills,
             get_search_preferences,
             set_include_disabled_skills,
             list_skill_relations,
             list_custom_skill_categories,
+            select_project_directory,
+            translate_display_texts,
             create_custom_skill_category,
             delete_custom_skill_category,
             add_skills_to_custom_category,
             replace_custom_category_members,
+            replace_custom_category_with_skills,
             get_skill_graph,
             generate_local_validation_samples,
             list_local_validation_samples,
@@ -5675,6 +6419,86 @@ mod tests {
         let path = std::env::temp_dir().join(format!("deadalus-{label}-{unique}"));
         fs::create_dir_all(&path).expect("temporary directory should be created");
         path
+    }
+
+    #[test]
+    fn project_deployment_preserves_incremental_files_and_category_deletion_preserves_project() {
+        let root = temporary_directory("project-deployment");
+        let project = root.join("project");
+        let existing = project.join(".agents/skills/existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(
+            existing.join("SKILL.md"),
+            "---\nname: existing\ndescription: Existing skill\n---\nExisting instructions",
+        )
+        .unwrap();
+        let source = root.join("global/incoming");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: incoming\ndescription: Incoming skill\n---\nNew instructions",
+        )
+        .unwrap();
+        let database = Database::open(root.join("test.sqlite")).unwrap();
+        let mut skill = test_canonical_skill("incoming", "incoming", &["codex"]);
+        skill.library_path = Some(source.to_string_lossy().into_owned());
+        let mut snapshot = test_canonical_snapshot();
+        snapshot.skills = vec![skill];
+        database.replace_canonical_snapshot(&snapshot).unwrap();
+        let category = CustomSkillCategory {
+            category_id: "project-test".into(),
+            name: "Project".into(),
+            description: "Test".into(),
+            color: "#4f8cff".into(),
+            skill_ids: Vec::new(),
+            shared_skill_ids: Vec::new(),
+            project_root: Some(project.to_string_lossy().into_owned()),
+            project_agent: Some("codex".into()),
+            created_at: 1,
+            updated_at: 1,
+        };
+        database.create_custom_skill_category(&category).unwrap();
+        deploy_project_members(&database, &category, &["incoming".into()], false).unwrap();
+        assert!(existing.join("SKILL.md").exists());
+        assert!(project.join(".agents/skills/incoming/SKILL.md").exists());
+        assert!(source.join("SKILL.md").exists());
+        let scanned = scan_project_skills(project.to_str().unwrap()).unwrap();
+        assert_eq!(scanned.len(), 3);
+        assert!(project.join(".claude/skills/incoming/SKILL.md").exists());
+        assert!(scanned.iter().all(|s| s.enabled_agents.is_empty()));
+        snapshot.skills[0].content_hash = scanned
+            .iter()
+            .find(|s| s.name == "incoming")
+            .unwrap()
+            .content_hash
+            .clone();
+        snapshot.snapshot_id = "snapshot-project-hashed".into();
+        database.replace_canonical_snapshot(&snapshot).unwrap();
+        deploy_project_members(&database, &category, &["incoming".into()], false).unwrap();
+        assert_eq!(
+            scan_project_skills(project.to_str().unwrap())
+                .unwrap()
+                .len(),
+            3
+        );
+        // An existing shared copy must not prevent restoring a missing Claude copy.
+        fs::rename(
+            project.join(".claude/skills/incoming"),
+            root.join("saved-claude"),
+        )
+        .unwrap();
+        deploy_project_members(&database, &category, &["incoming".into()], false).unwrap();
+        assert!(project.join(".claude/skills/incoming/SKILL.md").exists());
+        deploy_project_members(&database, &category, &[], true).unwrap();
+        assert!(scan_project_skills(project.to_str().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(project.join(".deadalus/project-copy").exists());
+        assert!(source.join("SKILL.md").exists());
+        database
+            .delete_custom_skill_category("project-test")
+            .unwrap();
+        assert!(project.exists());
     }
 
     fn test_canonical_skill(skill_id: &str, name: &str, enabled_agents: &[&str]) -> CanonicalSkill {
@@ -5717,6 +6541,7 @@ mod tests {
 
     fn test_key(id: &str, provider: &str) -> ApiKeyMetadata {
         ApiKeyMetadata {
+            purpose: None,
             id: id.to_string(),
             provider: provider.to_string(),
             masked_key: "••••test".to_string(),
@@ -5726,6 +6551,101 @@ mod tests {
             agent_model: None,
             legacy_is_active: None,
         }
+    }
+
+    #[test]
+    fn purpose_scoped_credentials_reject_cross_use_and_roundtrip() {
+        let mut agent = test_key("agent", "openai");
+        agent.purpose = Some(CredentialPurpose::Agent);
+        let mut embedding = test_key("embedding", "openai");
+        embedding.purpose = Some(CredentialPurpose::Embedding);
+        let mut keys = vec![agent, embedding];
+        assert!(activate_metadata_for_purpose(&mut keys, "agent", CredentialPurpose::Embedding).is_err());
+        assert!(activate_metadata_for_purpose(&mut keys, "embedding", CredentialPurpose::Agent).is_err());
+        assert!(validate_embedding_credential_by_id("openai", "agent", &keys, false).is_err());
+        activate_metadata_for_purpose(&mut keys, "agent", CredentialPurpose::Agent).unwrap();
+        activate_metadata_for_purpose(&mut keys, "embedding", CredentialPurpose::Embedding).unwrap();
+        assert!(keys[0].is_agent_active && !keys[0].is_embedding_active);
+        assert!(keys[1].is_embedding_active && !keys[1].is_agent_active);
+        let (restored, _) = parse_key_metadata(&serde_json::to_string(&keys).unwrap()).unwrap();
+        assert_eq!(restored[0].purpose, Some(CredentialPurpose::Agent));
+        assert_eq!(restored[1].purpose, Some(CredentialPurpose::Embedding));
+    }
+
+    #[test]
+    fn named_profiles_derive_configuration_from_active_embedding_credential() {
+        for (provider, model, dimensions) in [("openai", "text-embedding-3-small", 1536), ("qwen", "text-embedding-v4", 1024)] {
+            let mut key = test_key("embedding", provider);
+            key.purpose = Some(CredentialPurpose::Embedding);
+            key.is_embedding_active = true;
+            let request = CreateEmbeddingProfileRequest { name: "  我的索引  ".into(), description: " 简单描述 ".into(), credential_id: key.id.clone() };
+            let profile = named_embedding_profile(&request, &[key.clone()], 10).unwrap();
+            assert_eq!(profile.name, "我的索引");
+            assert_eq!(profile.description, "简单描述");
+            assert_eq!(profile.model, model);
+            assert_eq!(profile.dimensions, dimensions);
+            let rebuilt = clone_profile_for_rebuild(&profile, key.id.clone(), 11);
+            assert_eq!(rebuilt.name, profile.name);
+            assert_eq!(rebuilt.description, profile.description);
+            assert_ne!(rebuilt.profile_id, profile.profile_id);
+            key.is_embedding_active = false;
+            assert!(named_embedding_profile(&request, &[key.clone()], 10).is_err());
+            key.is_embedding_active = true;
+            key.purpose = Some(CredentialPurpose::Agent);
+            assert!(named_embedding_profile(&request, &[key], 10).is_err());
+        }
+        let request = CreateEmbeddingProfileRequest { name: " ".into(), description: String::new(), credential_id: "missing".into() };
+        assert!(named_embedding_profile(&request, &[], 10).is_err());
+    }
+
+    #[test]
+    fn analysis_model_defaults_are_provider_specific_and_preserve_selection() {
+        for (provider, model) in [("openai", "gpt-4.1-mini"), ("qwen", "qwen-plus"), ("anthropic", "claude-sonnet-4-6"), ("deepseek", "deepseek-flash")] {
+            let mut key = test_key("agent", provider);
+            assert_eq!(analysis_model_for_credential(&key).unwrap(), model);
+            key.agent_model = Some("chosen-model".into());
+            assert_eq!(analysis_model_for_credential(&key).unwrap(), "chosen-model");
+            key.purpose = Some(CredentialPurpose::Embedding);
+            assert!(analysis_model_for_credential(&key).is_err());
+        }
+    }
+
+    fn test_search_result(skill_id: &str, score: f32) -> SearchResult {
+        SearchResult {
+            skill_id: skill_id.to_string(),
+            score,
+            parent_score: score,
+            chunk_score: None,
+            expired: false,
+            matched_types: vec![VectorType::OverallFunction],
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn requirement_results_prioritize_category_fit_and_keep_global_over_half_rescue() {
+        let matches = vec![RequirementSkillMatch {
+            skill_id: "web-visualization".to_string(),
+            requirement_category_ids: vec!["req-web".to_string()],
+            fit_score: 0.9,
+            reason: "same domain and workflow".to_string(),
+        }];
+        let (results, sources) = combine_requirement_results(
+            &matches,
+            vec![test_search_result("web-visualization", 0.4)],
+            vec![test_search_result("unclassified-strong-vector", 0.51)],
+        );
+        assert_eq!(results.len(), 2);
+        let category = results
+            .iter()
+            .find(|item| item.skill_id == "web-visualization")
+            .unwrap();
+        assert!((category.score - 0.8).abs() < 0.0001);
+        assert_eq!(sources["web-visualization"], vec!["category_match"]);
+        assert_eq!(
+            sources["unclassified-strong-vector"],
+            vec!["global_cosine_over_0.50"]
+        );
     }
 
     #[test]
@@ -5781,6 +6701,8 @@ mod tests {
     ) -> EmbeddingProfile {
         EmbeddingProfile {
             profile_id: id.to_string(),
+            name: "Test profile".to_string(),
+            description: String::new(),
             provider: provider.to_string(),
             model: model.to_string(),
             model_version: version.to_string(),
