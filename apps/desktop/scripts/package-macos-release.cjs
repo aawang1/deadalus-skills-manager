@@ -29,7 +29,7 @@ function collect(name, version, license, dir, repository) {
   if (repository?.startsWith('https://github.com/') && fs.existsSync(vcs)) {
     const sha = JSON.parse(fs.readFileSync(vcs, 'utf8')).git.sha1;
     const repo = repository.replace('https://github.com/', '').replace(/\/$/, '').replace(/\.git$/, '');
-    for (const file of ['LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-BSD', 'LICENSE-MPL', 'LICENSE.txt']) {
+    for (const file of ['LICENSE', 'LICENSE.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-BSD', 'LICENSE-MPL', 'LICENSE.txt']) {
       const url = `https://raw.githubusercontent.com/${repo}/${sha}/${file}`;
       try {
         const content = execFileSync('curl', ['-fLsS', '--max-time', '15', url], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -43,7 +43,7 @@ function collect(name, version, license, dir, repository) {
     if (!content.includes('Mozilla Public License')) throw new Error('Invalid license response');
     notices.push(`\n--- ${url} ---\n${content}`); recovered = true;
   }
-  if (!recovered) { missing++; notices.push('License text missing; consult upstream before distribution.'); }
+  if (!recovered) { missing++; console.error(`Missing license: ${name} ${version}`); notices.push('License text missing; consult upstream before distribution.'); }
 }
 for (const p of metadata.packages.filter(p => p.source)) collect(p.name, p.version, p.license, path.dirname(p.manifest_path), p.repository);
 const lock = JSON.parse(fs.readFileSync(path.join(app, 'package-lock.json'), 'utf8'));
