@@ -10,7 +10,7 @@ export default defineConfig(async () => ({
   test: {
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
-    css: false,
+    css: { include: [/App\.css/] },
     clearMocks: true,
   },
 

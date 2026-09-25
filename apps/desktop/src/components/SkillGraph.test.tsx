@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { SkillGraph } from "./SkillGraph";
@@ -87,6 +87,45 @@ const graph = {
 };
 
 describe("SkillGraph", () => {
+  it("preserves canvas panning on release and during later node spring-back", async () => {
+    mocks.getSkillGraph.mockResolvedValue(graph);
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const user = userEvent.setup();
+    render(<SkillGraph activeView="cursor" isNative refreshKey={0} />);
+    const node = await screen.findByRole("button", { name: "Review Skill Skill" });
+    const canvas = screen.getByRole("img", { name: "Cursor Skills 径向关系图" });
+    vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({
+      x: 0, y: 0, left: 0, top: 0, right: 1000, bottom: 800,
+      width: 1000, height: 800, toJSON: () => ({}),
+    });
+    const layer = canvas.firstElementChild!;
+    const initial = layer.getAttribute("transform");
+    await user.pointer([
+      { keys: "[MouseLeft>]", target: canvas, coords: { clientX: 100, clientY: 100 } },
+      { target: canvas, coords: { clientX: 250, clientY: 180 } },
+    ]);
+    const panned = layer.getAttribute("transform");
+    expect(panned).not.toBe(initial);
+    await user.pointer({ keys: "[/MouseLeft]", target: canvas });
+    expect(frames).toHaveLength(0);
+    expect(layer.getAttribute("transform")).toBe(panned);
+    await user.pointer([
+      { keys: "[MouseLeft>]", target: node, coords: { clientX: 250, clientY: 180 } },
+      { target: canvas, coords: { clientX: 280, clientY: 200 } },
+      { keys: "[/MouseLeft]", target: canvas },
+    ]);
+    expect(frames.length).toBeGreaterThan(0);
+    act(() => {
+      for (let i = 0; frames.length && i < 100; i++) frames.shift()!(i * 16);
+    });
+    expect(frames).toHaveLength(0);
+    expect(layer.getAttribute("transform")).toBe(panned);
+  });
+
   it("opens node details on double click and closes outside", async () => {
     mocks.getSkillGraph.mockResolvedValue(graph);
     const user = userEvent.setup();
@@ -115,7 +154,8 @@ describe("SkillGraph", () => {
     await user.dblClick(container.querySelector(".skill-graph__edge-hit")!);
 
     expect(screen.getByText("具体关系")).toBeInTheDocument();
-    expect(screen.getByText("功能相似（向量过阈）")).toBeInTheDocument();
+    expect(screen.getByText("功能相似")).toBeInTheDocument();
+    expect(screen.queryByText(/向量过阈|超过可视化阈值|over_threshold/)).not.toBeInTheDocument();
     expect(screen.getByText("前置或依赖")).toBeInTheDocument();
     expect(container.querySelectorAll(".skill-graph__edge-hit")).toHaveLength(2);
   });

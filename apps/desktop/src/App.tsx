@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api, isNativeRuntime as detectNativeRuntime } from "./api";
 import { filterCanonicalSkills } from "./canonical";
 import { CreateCategoryDialog } from "./components/CreateCategoryDialog";
+import { removeAgentHistory } from "./agentHistory";
 import { AgentComposer } from "./components/AgentComposer";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SkillGraph } from "./components/SkillGraph";
@@ -23,6 +24,7 @@ type NavigationGroup = "agents" | "custom" | "projects";
 type CategoryCopyMode = "incremental" | "overwrite";
 const AGENT_WINDOWS_STORAGE_KEY = "deadalus.agent-windows.v3";
 interface AgentWindowRegistry {
+    names?: Record<string, string>;
     ids: number[];
     nextId: number;
     bindings: Record<string, ViewId>;
@@ -47,7 +49,11 @@ function savedAgentWindows(): AgentWindowRegistry {
                 bindings &&
                 typeof bindings === "object" &&
                 ids.every((id) => isStoredViewId(bindings[String(id)]))) {
-                return { ids, nextId: registry.nextId, bindings };
+                const names = Object.fromEntries(ids.flatMap((id) => {
+                    const name = registry.names?.[String(id)];
+                    return typeof name === "string" && name.trim() ? [[String(id), name.trim().slice(0, 60)]] : [];
+                }));
+                return { ids, nextId: registry.nextId, bindings, ...(Object.keys(names).length ? { names } : {}) };
             }
         }
     }
@@ -82,6 +88,8 @@ function App() {
         viewId: ViewId;
         skillIds: string[];
     }>>({});
+    const [agentRename, setAgentRename] = useState<{ id: number; name: string }>();
+    const agentName = (id: number) => agentWindows.names?.[String(id)] ?? `Agent ${id}`;
     const isAssistantOpen = activeAgentWindow !== null;
     const [agentWindowContextMenu, setAgentWindowContextMenu] = useState<{
         windowId: number;
@@ -167,6 +175,7 @@ function App() {
             return;
         const next = agentWindows.nextId;
         setAgentWindows({
+            ...agentWindows,
             ids: [...agentWindows.ids, next],
             nextId: next + 1,
             bindings: { ...agentWindows.bindings, [String(next)]: activeView },
@@ -180,8 +189,11 @@ function App() {
         setAgentWindows((current) => {
             const bindings = { ...current.bindings };
             delete bindings[String(windowId)];
+            const names = current.names ? { ...current.names } : undefined;
+            if (names) delete names[String(windowId)];
             return {
                 ...current,
+                names,
                 ids: current.ids.filter((id) => id !== windowId),
                 bindings,
             };
@@ -189,6 +201,7 @@ function App() {
         if (activeAgentWindow === windowId)
             setActiveAgentWindow(null);
         setAgentHighlights((current) => { const next = { ...current }; delete next[windowId]; return next; });
+        removeAgentHistory(windowId);
         setAgentWindowDeleteDialog(undefined);
     };
     useEffect(() => {
@@ -435,6 +448,7 @@ function App() {
             const deletedView: ViewId = `custom:${category.categoryId}`;
             const removedAgentIds = agentWindows.ids.filter((id) => agentWindows.bindings[String(id)] === deletedView);
             if (removedAgentIds.length) {
+                removedAgentIds.forEach(removeAgentHistory);
                 setAgentWindows((current) => {
                     const bindings = { ...current.bindings };
                     for (const id of removedAgentIds)
@@ -916,7 +930,11 @@ function App() {
                 setAgentWindowContextMenu(undefined);
             }}>
           <div className="category-context-menu" role="menu" aria-label={tr("Agent {0} 窗口操作", agentWindowContextMenu.windowId)} style={{ left: agentWindowContextMenu.x, top: agentWindowContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
-            <button ref={agentWindowMenuButtonRef} type="button" role="menuitem" onClick={() => {
+            <button ref={agentWindowMenuButtonRef} className="agent-rename-menu-item" type="button" role="menuitem" onClick={() => {
+                setAgentRename({ id: agentWindowContextMenu.windowId, name: agentName(agentWindowContextMenu.windowId) });
+                setAgentWindowContextMenu(undefined);
+            }}>{tr("重命名")}</button>
+            <button type="button" role="menuitem" onClick={() => {
                 setAgentWindowDeleteDialog(agentWindowContextMenu.windowId);
                 setAgentWindowContextMenu(undefined);
             }}>
@@ -1268,6 +1286,21 @@ function App() {
           </section>
         </div>)}
 
+      {agentRename && <div className="skill-action-backdrop" role="presentation">
+        <form className="skill-action-dialog agent-rename-dialog" role="dialog" aria-modal="true" aria-labelledby="agent-rename-title"
+          onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setAgentRename(undefined); } }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            const name = agentRename.name.trim();
+            if (!name || name.length > 60) return;
+            setAgentWindows((current) => ({ ...current, names: { ...current.names, [String(agentRename.id)]: name } }));
+            setAgentRename(undefined);
+          }}>
+          <h3 id="agent-rename-title">{tr("重命名 Agent")}</h3>
+          <label>{tr("Agent 名称")}<input autoFocus maxLength={60} value={agentRename.name} onChange={(event) => setAgentRename({ ...agentRename, name: event.currentTarget.value })}/></label>
+          <footer><button type="button" onClick={() => setAgentRename(undefined)}>{tr("取消")}</button><button type="submit" disabled={!agentRename.name.trim()}>{tr("保存")}</button></footer>
+        </form>
+      </div>}
       {agentWindowDeleteDialog !== undefined && (<div className="skill-action-backdrop" role="presentation">
           <section className="skill-action-dialog category-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="agent-window-delete-title">
             <header>
@@ -1279,8 +1312,8 @@ function App() {
                 ×
               </button>
             </header>
-            <strong>Agent {agentWindowDeleteDialog}</strong>
-            <p>{tr("确认删除这个窗口？该窗口当前会话中的未发送输入会丢失；不会删除其他 Agent 窗口、Skills、API Keys 或向量数据。")}</p>
+            <strong>{agentName(agentWindowDeleteDialog)}</strong>
+            <p>{tr("确认删除这个窗口？该窗口的检索历史和未发送输入会删除；不会删除其他 Agent 窗口、Skills、API Keys 或向量数据。")}</p>
             <footer>
               <button type="button" onClick={() => setAgentWindowDeleteDialog(undefined)}>{tr("取消")}</button>
               <button type="button" className="danger-button" onClick={deleteAgentWindow}>{tr("确认删除")}</button>
@@ -1289,13 +1322,22 @@ function App() {
         </div>)}
 
       <main className="main-platform" aria-label={tr("A1 可视化工作区")}>
-            {activeView && (<SkillGraph activeView={activeView} viewLabel={activeCustomCategory?.name} isNative={isNativeRuntime} refreshKey={graphRevision + libraryVersion} highlightSkillIds={activeAgentWindow !== null && agentHighlights[activeAgentWindow]?.viewId === activeView ? agentHighlights[activeAgentWindow].skillIds : []}/>)}
+            {activeView && (<SkillGraph activeView={activeView} viewLabel={activeCustomCategory?.name} isNative={isNativeRuntime} refreshKey={graphRevision + libraryVersion} onToggleSkill={activeAgentWindow !== null && agentHighlights[activeAgentWindow]?.viewId === activeView ? (skillId) => {
+                const windowId = activeAgentWindow;
+                setAgentHighlights((current) => {
+                    const entry = current[windowId];
+                    if (!entry || entry.viewId !== activeView) return current;
+                    return { ...current, [windowId]: { ...entry, skillIds: entry.skillIds.includes(skillId)
+                        ? entry.skillIds.filter((id) => id !== skillId)
+                        : [...entry.skillIds, skillId] } };
+                });
+            } : undefined} highlightSkillIds={activeAgentWindow !== null && agentHighlights[activeAgentWindow]?.viewId === activeView ? agentHighlights[activeAgentWindow].skillIds : []}/>)}
       </main>
 
       <aside className="assistant-platform" aria-label={tr("B3 Agent 平台")}>
         <div className="assistant-platform__content" aria-hidden={!isAssistantOpen}>
           {agentWindows.ids.map((windowId) => (<div key={windowId} className="assistant-platform__pane" hidden={activeAgentWindow !== windowId} aria-label={tr("Agent {0} 窗口", windowId)}>
-                <AgentComposer windowId={windowId} indexRevision={graphRevision + libraryVersion} activeView={agentWindows.bindings[String(windowId)]} skills={skillResult?.skills ?? []} categories={customCategories} onCreateCategory={createCustomCategory} onCopy={copyRecommendedSkills} onRecommendationChange={(id, viewId, skillIds) => setAgentHighlights((current) => { const next = { ...current }; if (viewId)
+                <AgentComposer selectedSkillIds={agentHighlights[windowId]?.skillIds} windowId={windowId} indexRevision={graphRevision + libraryVersion} activeView={agentWindows.bindings[String(windowId)]} skills={skillResult?.skills ?? []} categories={customCategories} onCreateCategory={createCustomCategory} onCopy={copyRecommendedSkills} onRecommendationChange={(id, viewId, skillIds) => setAgentHighlights((current) => { const next = { ...current }; if (viewId)
             next[id] = { viewId, skillIds };
         else
             delete next[id]; return next; })}/>
@@ -1307,19 +1349,21 @@ function App() {
             const boundView = agentWindows.bindings[String(windowId)];
             const boundLabel = viewLabel(boundView);
             const boundCategory = customCategories.find((category) => `custom:${category.categoryId}` === boundView);
-            const label = windowId === 1
+            const label = agentWindows.names?.[String(windowId)]
+                ? selected ? tr("收起 {0}", agentName(windowId)) : tr("打开 {0}", agentName(windowId))
+                : windowId === 1
                 ? selected ? tr("收起 Agent 1") : tr("打开 Agent 1")
                 : selected ? tr("收起 Agent {0}", windowId) : tr("打开 Agent {0}", windowId);
-            return (<button key={windowId} className={`agent-button category-button assistant-entry ${selected ? "agent-button--active" : ""}`} type="button" aria-label={label} aria-pressed={selected} aria-expanded={selected} title={`Agent ${windowId} · ${boundLabel}`} onClick={() => toggleAgentWindow(windowId)} onContextMenu={(event) => {
+            return (<button key={windowId} className={`agent-button category-button assistant-entry ${selected ? "agent-button--active" : ""}`} type="button" aria-label={label} aria-pressed={selected} aria-expanded={selected} title={`${agentName(windowId)} · ${boundLabel}`} onClick={() => toggleAgentWindow(windowId)} onContextMenu={(event) => {
                     event.preventDefault();
                     setAgentWindowContextMenu({
                         windowId,
                         x: Math.max(8, Math.min(event.clientX, window.innerWidth - 176)),
-                        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 64)),
+                        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 100)),
                     });
                 }}>
                   {boundCategory?.color && <span className="category-button__dot" style={{ backgroundColor: boundCategory.color }} aria-hidden="true"/>}
-                  <span className="assistant-entry__label">Agent {windowId}</span>
+                  <span className="assistant-entry__label">{agentName(windowId)}</span>
                 </button>);
         })}
           <button className="agent-button agent-button--add assistant-entry" type="button" aria-label={tr("新建 Agent 窗口")} title={activeView ? tr("为“{0}”新建 Agent", viewLabel(activeView)) : tr("请先选择一个 Skills 类别")} disabled={!activeView || agentWindows.ids.length >= 100} onClick={createAgentWindow}>

@@ -429,7 +429,7 @@ async fn save_api_key(
         .map_err(|error| format!("无法访问系统凭据库：{error}"))?;
     credential
         .set_password(api_key)
-        .map_err(|error| format!("无法保存到 Windows Credential Manager：{error}"))?;
+        .map_err(|error| format!("无法保存到系统凭据存储：{error}"))?;
 
     let metadata = ApiKeyMetadata {
         purpose: Some(purpose),
@@ -547,7 +547,7 @@ fn delete_api_key(
         .map_err(|error| format!("无法访问系统凭据库：{error}"))?;
     if let Err(error) = credential.delete_credential() {
         let _ = write_key_metadata(&app, &original_keys);
-        return Err(format!("无法从 Windows Credential Manager 删除：{error}"));
+        return Err(format!("无法从系统凭据存储删除：{error}"));
     }
     database
         .detach_credential(&id)

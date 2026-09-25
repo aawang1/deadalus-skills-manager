@@ -103,11 +103,15 @@ Back up Skills before overwrite/uninstall operations. This is an initial release
 `);
 write('RELEASE-NOTES.txt', `Deadalus ${releaseLabel} — Windows x64 release
 Release title/tag: ${releaseLabel} (suggested; not created automatically)
-Base source commit: ${commit}; includes local version and packaging updates.
+Base source commit: ${commit}; built from the current working tree, including local uncommitted changes.
 Packaging overlay: src-tauri/tauri.release.conf.json
 
 Included: Skill library and project categories; Agent-assisted organization; embedding Profiles and visualization;
 Chinese/English UI; purpose-scoped API keys; automatic embedding configuration; blue D application icon.
+
+This V1.0.0 refresh includes per-Agent persistent search history, pending-analysis bubbles,
+Agent renaming, editable recommended Skill selections, persistent canvas panning,
+and simplified recommendation/relationship labels.
 
 Distribution: current-user NSIS installer, Chinese/English installation UI, embedded online WebView2 bootstrapper.
 Signing: not code-signed. No automatic GitHub upload was performed.

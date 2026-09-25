@@ -1,0 +1,61 @@
+name: Build macOS V1.0.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macos-release.yml'
+      - 'apps/desktop/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install Rust targets
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: npm ci
+      - run: npm test
+      - run: npm run check:i18n
+      - name: Test native code
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+      - name: Build universal application and disk image
+        run: npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
+      - name: Verify bundle
+        run: |
+          APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/Deadalus.app
+          lipo -verify_arch arm64 x86_64 "$APP/Contents/MacOS/deadalus-desktop"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = '1.0.0'
+          for image in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do hdiutil verify "$image"; done
+      - name: Assemble public package
+        run: node scripts/package-macos-release.cjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Deadalus-1.0.0-macos-universal
+          path: apps/desktop/release-output/Deadalus-1.0.0-macos-universal.zip
+          if-no-files-found: error
+          retention-days: 14

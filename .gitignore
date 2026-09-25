@@ -79,6 +79,7 @@ skills-lock.json
 # Frontend dependencies, output, and caches
 **/node_modules/
 **/dist/
+**/release-output/
 **/dist-ssr/
 **/coverage/
 **/.vite/

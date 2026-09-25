@@ -10,6 +10,7 @@ interface SkillGraphProps {
     isNative: boolean;
     refreshKey: number;
     highlightSkillIds?: string[];
+    onToggleSkill?: (skillId: string) => void;
 }
 type Selection = {
     type: "node";
@@ -89,15 +90,15 @@ const stateLabels: Record<string, string> = {
     get revalidated() {
         return tr("已复核");
     },
-    get over_threshold() {
-        return tr("超过可视化阈值");
-    },
     get nearest_fallback() {
         return tr("最近无冲突节点");
     },
 };
-export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highlightSkillIds = [], }: SkillGraphProps) {
+export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highlightSkillIds = [], onToggleSkill, }: SkillGraphProps) {
     const highlighted = useMemo(() => new Set(highlightSkillIds), [highlightSkillIds]);
+    const highlightSignature = JSON.stringify(highlightSkillIds);
+    const editingRecommendation = Boolean(onToggleSkill);
+    useEffect(() => { setSelection(null); }, [highlightSignature, editingRecommendation]);
     const activeViewLabel = viewLabel ?? agentViewLabels[activeView as keyof typeof agentViewLabels] ?? tr("自定义类别");
     const [graph, setGraph] = useState<SkillGraphSnapshot>();
     const [state, setState] = useState<"loading" | "ready" | "error">(isNative ? "loading" : "ready");
@@ -198,7 +199,7 @@ export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highli
         const sourceCluster = nodesById.get(edge.sourceSkillId)?.clusterId;
         const targetCluster = nodesById.get(edge.targetSkillId)?.clusterId;
         const classes = [sourceCluster !== targetCluster ? "is-cross-cluster" : ""];
-        if (highlighted.size && !selectedNode && !selectedCluster && !selectedEdge)
+        if ((onToggleSkill || highlighted.size > 0) && !selectedNode && !selectedCluster && !selectedEdge)
             classes.push(highlighted.has(edge.sourceSkillId) && highlighted.has(edge.targetSkillId) ? "is-recommended" : "is-recommendation-muted");
         if (selectedNode) {
             classes.push(edge.sourceSkillId === selectedNode.skillId || edge.targetSkillId === selectedNode.skillId
@@ -294,21 +295,19 @@ export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highli
     const endDrag = () => {
         if (!activeDragRef.current)
             return;
+        const wasCanvasDrag = activeDragRef.current.type === "canvas";
         activeDragRef.current = undefined;
-        animateReturn();
+        if (!wasCanvasDrag)
+            animateReturn();
     };
     const animateReturn = () => {
         if (returnAnimationRef.current) {
             cancelAnimationFrame(returnAnimationRef.current);
         }
         const step = () => {
-            const nextPan = {
-                x: panOffsetRef.current.x * 0.78,
-                y: panOffsetRef.current.y * 0.78,
-            };
             const nextOffsets: Record<string, GraphPoint> = {};
             const nextClusterOffsets: Record<string, GraphPoint> = {};
-            let moving = Math.hypot(nextPan.x, nextPan.y) > 0.25;
+            let moving = false;
             for (const [skillId, offset] of Object.entries(dragOffsetsRef.current)) {
                 const next = { x: offset.x * 0.78, y: offset.y * 0.78 };
                 if (Math.hypot(next.x, next.y) > 0.25) {
@@ -323,10 +322,8 @@ export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highli
                     moving = true;
                 }
             }
-            panOffsetRef.current = moving ? nextPan : { x: 0, y: 0 };
             dragOffsetsRef.current = moving ? nextOffsets : {};
             clusterOffsetsRef.current = moving ? nextClusterOffsets : {};
-            setPanOffset(panOffsetRef.current);
             setDragOffsets(dragOffsetsRef.current);
             setClusterOffsets(clusterOffsetsRef.current);
             if (moving) {
@@ -374,14 +371,24 @@ export function SkillGraph({ activeView, viewLabel, isNative, refreshKey, highli
           <g className="skill-graph__nodes">
             {(graph?.nodes ?? []).map((node, index) => {
             const point = displayPoint(node.skillId);
-            return (<g key={node.skillId} className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${node.disabled ? " is-disabled" : ""}${node.classificationStatus !== "ready" ? " is-classification-stale" : ""}${highlighted.size && !selectedNode && !selectedCluster && !selectedEdge ? highlighted.has(node.skillId) ? " is-recommended" : " is-recommendation-muted" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`} transform={`translate(${point.x} ${point.y})`} tabIndex={0} role="button" aria-label={`${node.name} Skill`} onPointerDown={(event) => beginNodeDrag(event, node.skillId)} onDoubleClick={(event) => {
+            return (<g key={node.skillId} className={`skill-graph__node${node.superseded ? " is-superseded" : ""}${node.disabled ? " is-disabled" : ""}${node.classificationStatus !== "ready" ? " is-classification-stale" : ""}${(onToggleSkill || highlighted.size > 0) && !selectedNode && !selectedCluster && !selectedEdge ? highlighted.has(node.skillId) ? " is-recommended" : " is-recommendation-muted" : ""}${selectedNode && selectedNode.skillId !== node.skillId ? " is-muted" : ""}${selectedCluster && node.clusterId !== selectedCluster.clusterId ? " is-muted" : ""}`} transform={`translate(${point.x} ${point.y})`} tabIndex={0} role="button" aria-label={`${node.name} Skill`} aria-pressed={onToggleSkill ? highlighted.has(node.skillId) : undefined} onPointerDown={(event) => beginNodeDrag(event, node.skillId)} onDoubleClick={(event) => {
                     event.stopPropagation();
-                    setSelection({ type: "node", nodeId: node.skillId });
+                    if (onToggleSkill) {
+                        setSelection(null);
+                        onToggleSkill(node.skillId);
+                    } else {
+                        setSelection({ type: "node", nodeId: node.skillId });
+                    }
                 }} onKeyDown={(event) => {
                     if (event.key !== "Enter" && event.key !== " ")
                         return;
                     event.preventDefault();
-                    setSelection({ type: "node", nodeId: node.skillId });
+                    if (onToggleSkill) {
+                        setSelection(null);
+                        onToggleSkill(node.skillId);
+                    } else {
+                        setSelection({ type: "node", nodeId: node.skillId });
+                    }
                 }}>
                   <g className="skill-graph__node-motion" style={{
                     animationDelay: `${-(index % 11) * 0.37}s`,
@@ -468,7 +475,7 @@ function EdgePopup({ edge, source, target, onPointerDown, }: {
         <ul>
           {edge.relations.map((relation, index) => (<li key={`${relation.relationshipType}:${relation.state}:${index}`}>
               <span>{relationLabel(relation)}</span>
-              <small>{stateLabels[relation.state] ?? relation.state}</small>
+              {relation.state !== "over_threshold" && <small>{stateLabels[relation.state] ?? relation.state}</small>}
             </li>))}
         </ul>
       </div>
@@ -512,7 +519,7 @@ function relationLabel(relation: SkillGraphRelation): string {
     const base = relationLabels[relation.relationshipType] ?? relation.relationshipType;
     if (relation.source === "vector_similarity") {
         return relation.state === "nearest_fallback"
-            ? tr("{0}（最近无冲突）", base) : tr("{0}（向量过阈）", base);
+            ? tr("{0}（最近无冲突）", base) : base;
     }
     return base;
 }

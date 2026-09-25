@@ -380,7 +380,7 @@ describe("B3 assistant platform", () => {
     });
     await user.click(screen.getByRole("menuitem", { name: "删除该 Agent 窗口" }));
     const dialog = screen.getByRole("alertdialog", { name: "删除 Agent 窗口" });
-    expect(within(dialog).getByText(/未发送输入会丢失/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/检索历史和未发送输入会删除/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "取消" }));
     expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("temporary draft");
 
@@ -394,6 +394,38 @@ describe("B3 assistant platform", () => {
       nextId: 2,
       bindings: {},
     });
+  });
+
+  it("renames an Agent without changing its identity, binding or draft and restores the name", async () => {
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    await user.click(screen.getByRole("button", { name: "所有 Skills" }));
+    await user.click(screen.getByRole("button", { name: "新建 Agent 窗口" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 1 输入" }), "preserved draft");
+    fireEvent.contextMenu(screen.getByRole("button", { name: "收起 Agent 1" }));
+    expect(screen.getAllByRole("menuitem")[0]).toHaveTextContent("重命名");
+    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
+    const dialog = screen.getByRole("dialog", { name: "重命名 Agent" });
+    const input = within(dialog).getByRole("textbox", { name: "Agent 名称" });
+    await user.clear(input);
+    await user.type(input, "   ");
+    expect(within(dialog).getByRole("button", { name: "保存" })).toBeDisabled();
+    await user.clear(input);
+    await user.type(input, "网页助手");
+    await user.click(within(dialog).getByRole("button", { name: "保存" }));
+    expect(screen.getByRole("button", { name: "收起 网页助手" })).toHaveTextContent("网页助手");
+    expect(screen.getByRole("textbox", { name: "Agent 1 输入" })).toHaveValue("preserved draft");
+    const saved = JSON.parse(localStorage.getItem("deadalus.agent-windows.v3")!);
+    expect(saved.names["1"]).toBe("网页助手");
+    expect(saved.bindings["1"]).toBe("all");
+    unmount();
+    render(<App />);
+    expect(screen.getByRole("button", { name: "打开 网页助手" })).toBeInTheDocument();
+    fireEvent.contextMenu(screen.getByRole("button", { name: "打开 网页助手" }));
+    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 名称" }), "取消修改");
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByRole("button", { name: "打开 网页助手" })).toBeInTheDocument();
   });
 
   it("keeps later Agent identities and drafts when deleting a middle window", async () => {
