@@ -37,17 +37,29 @@ jobs:
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - run: npm ci
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: rust-cache
+        with:
+          path: apps/desktop/src-tauri/target
+          key: macos-universal-v1-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: macos-universal-v1-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock') }}-
       - run: npm test
       - run: npm run check:i18n
       - name: Test native code
         working-directory: apps/desktop/src-tauri
         run: cargo test --locked
       - name: Build universal application and disk image
+        id: bundle
         run: npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && steps.bundle.outcome == 'success'
+        with:
+          path: apps/desktop/src-tauri/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
       - name: Verify bundle
         run: |
           APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/Deadalus.app
-          lipo -verify_arch arm64 x86_64 "$APP/Contents/MacOS/deadalus-desktop"
+          lipo "$APP/Contents/MacOS/deadalus-desktop" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$APP"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = '1.0.0'
           for image in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do hdiutil verify "$image"; done
