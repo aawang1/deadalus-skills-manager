@@ -21,12 +21,13 @@
 **/auth.local.json
 **/api-key-metadata.json
 
-# README files stay local by repository policy
+# README files stay local except the public root README below
 **/[Rr][Ee][Aa][Dd][Mm][Ee]
 **/[Rr][Ee][Aa][Dd][Mm][Ee].*
 
-# All Markdown documentation stays local
+# Markdown documentation stays local; only the public root README is published
 **/*.md
+!/README.md
 
 # User and private Skill libraries
 **/all_skills/**
